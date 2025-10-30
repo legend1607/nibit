@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="liche">
+  <link
+    name="base">
+    <inertial>
+      <origin
+        xyz="0.48607 0.28055 -0.89353"
+        rpy="0 0 0" />
+      <mass
+        value="3402.9" />
+      <inertia
+        ixx="712.91"
+        ixy="0.14821"
+        ixz="-0.74318"
+        iyy="1260.9"
+        iyz="-4.305"
+        izz="647.52" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/base.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/base.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="body">
+    <inertial>
+      <origin
+        xyz="-0.205228553344964 0.11124837629825 0.279866206357492"
+        rpy="0 0 0" />
+      <mass
+        value="476.234267653959" />
+      <inertia
+        ixx="62.2587499845095"
+        ixy="-29.3774781868211"
+        ixz="16.2589026535527"
+        iyy="132.265489829395"
+        iyz="4.06719084609397"
+        izz="160.235513881902" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/body.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/body.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="base_body"
+    type="revolute">
+    <origin
+      xyz="0.48559 0.87696 0.60176"
+      rpy="0 -0.0023651 -1.5708" />
+    <parent
+      link="base" />
+    <child
+      link="body" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-3"
+      upper="3"
+      effort="0"
+      velocity="1" />
+  </joint>
+  <link
+    name="boom">
+    <inertial>
+      <origin
+        xyz="0.904017835038203 1.09623549961981 5.20499748007941E-06"
+        rpy="0 0 0" />
+      <mass
+        value="1699.33690863447" />
+      <inertia
+        ixx="292.823197209436"
+        ixy="-374.695834071447"
+        ixz="0.002723550893441"
+        iyy="779.871145296399"
+        iyz="0.00108560652285573"
+        izz="1061.59664620019" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/boom.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/boom.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="body_boom"
+    type="revolute">
+    <origin
+      xyz="0.27302 -0.0033226 0.1846"
+      rpy="1.5708 0 0" />
+    <parent
+      link="body" />
+    <child
+      link="boom" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.45"
+      upper="1"
+      effort="0"
+      velocity="1" />
+  </joint>
+  <link
+    name="arm">
+    <inertial>
+      <origin
+        xyz="-0.00094534 -0.54866 -0.0057659"
+        rpy="0 0 0" />
+      <mass
+        value="947.29" />
+      <inertia
+        ixx="178.77"
+        ixy="-44.737"
+        ixz="5.2245E-14"
+        iyy="29.44"
+        iyz="1.1731E-13"
+        izz="201.93" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/arm.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.77647 0.75686 0.73725 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/arm.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="boom_arm"
+    type="revolute">
+    <origin
+      xyz="2.6634 1.6057 0"
+      rpy="0 0 -0.0023651" />
+    <parent
+      link="boom" />
+    <child
+      link="arm" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.45"
+      upper="1"
+      effort="0"
+      velocity="1" />
+  </joint>
+  <link
+    name="bucket">
+    <inertial>
+      <origin
+        xyz="-0.1543 -0.32302 -0.0052375"
+        rpy="0 0 0" />
+      <mass
+        value="273.21" />
+      <inertia
+        ixx="18.411"
+        ixy="-3.4317"
+        ixz="0.0018832"
+        iyy="25.26"
+        iyz="-0.0027849"
+        izz="23.388" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/bucket.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.77647 0.75686 0.73725 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://liche/meshes/bucket.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="arm_bucket"
+    type="revolute">
+    <origin
+      xyz="-0.27546 -1.4745 0"
+      rpy="0 0 0" />
+    <parent
+      link="arm" />
+    <child
+      link="bucket" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.7"
+      upper="1"
+      effort="0"
+      velocity="1" />
+  </joint>
+</robot>

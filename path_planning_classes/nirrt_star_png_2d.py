@@ -1,0 +1,596 @@
+# path_planning_classes/nirrt_star_png_2d.py
+import os
+from matplotlib import pyplot as plt
+import numpy as np
+import time
+from path_planning_classes.irrt_star_2d import IRRTStar2D
+from path_planning_classes.rrt_base_2d import RRTBase2D
+from path_planning_classes.rrt_visualizer_2d import NIRRTStarVisualizer
+import math
+
+import open3d as o3d
+
+from path_planning_classes.collision_check_utils import points_in_range
+
+def get_binary_mask(env_img):
+    """
+    - inputs:
+        - env_img: np (img_height, img_width, 3)
+        - binary_mask: np float 0. or 1. (img_height, img_width)
+    """
+    env_dims = env_img.shape[:2]
+    binary_mask = np.zeros(env_dims).astype(float)
+    binary_mask[env_img[:,:,0]!=0]=1
+    return binary_mask
+
+def get_point_cloud_mask_around_points(point_cloud, points, neighbor_radius=3):
+    """
+    - 自动支持 point_cloud 和 points 的任意维度
+    - point_cloud: (n, C)
+    - points: (m, C)
+    - neighbor_radius: 半径阈值
+    """
+    point_cloud = np.asarray(point_cloud)
+    points = np.asarray(points)
+
+    # 检查维度一致
+    assert point_cloud.shape[1] == points.shape[1], "point_cloud 和 points 维度不一致"
+
+    # 计算欧氏距离
+    diff = point_cloud[:, np.newaxis, :] - points[np.newaxis, :, :]  # (n, m, C)
+    dist = np.linalg.norm(diff, axis=2)  # (n, m)
+
+    # 判断是否在邻域半径内
+    neighbor_mask = dist < neighbor_radius  # (n, m)
+    around_points_mask = np.any(neighbor_mask, axis=1)  # (n,)
+
+    return around_points_mask
+
+# *** Rectangular sampling ***
+def generate_rectangle_point_cloud(
+    binary_mask,
+    n_points,
+    over_sample_scale=5,
+):
+    """
+    - outputs:
+        - point_cloud: (n_points, 2)
+    """
+    img_height, img_width = binary_mask.shape
+    # oversampling in whole region
+    point_cloud = np.random.uniform(
+        low=[0, 0],
+        high=[img_width, img_height],
+        size=(n_points*over_sample_scale, 2),
+    )
+    # remove points in occupied space
+    point_cloud_pix = point_cloud.astype(int)
+    point_cloud_neighbors = []
+    for i in range(0, 2):
+        for j in range(0, 2):
+            point_cloud_neighbors.append(point_cloud_pix+np.array([i,j]))
+    pix_nei_offset = np.array([[0,0],[0,1],[1,0],[1,1]])[:,np.newaxis] # (4,1,2)
+    point_cloud_pix_nei = point_cloud_pix + pix_nei_offset # (4, n, 2)
+    point_cloud_pix_nei = point_cloud_pix_nei.reshape(-1,2)
+    point_cloud_pix_nei[:,1] = np.clip(point_cloud_pix_nei[:,1], 0, img_height-1)
+    point_cloud_pix_nei[:,0] = np.clip(point_cloud_pix_nei[:,0], 0, img_width-1)
+    point_cloud_occupied_mask = np.prod(
+        binary_mask[point_cloud_pix_nei[:,1],point_cloud_pix_nei[:,0]].reshape(4,-1),
+        axis=0,
+    ) # (n,)
+    point_cloud = point_cloud[point_cloud_occupied_mask.nonzero()[0]]
+    # downsample
+    point_cloud_fake_z = np.concatenate([point_cloud, np.zeros((point_cloud.shape[0],1))],axis=1) # (n,3)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(point_cloud_fake_z)
+    pcd = pcd.farthest_point_down_sample(num_samples=n_points)
+    point_cloud = np.asarray(pcd.points)[:,:2]
+    return point_cloud
+
+
+# *** Ellipse sampling ***
+def RotationToWorldFrame(start_point, goal_point, L):
+    """
+    - inputs:
+        - start_point: np float64 (2,)
+        - goal_point: np float64 (2,)
+        - L: scalar
+    - outputs:
+        - C: rotation matrix, np float64 (3,3)
+    """
+    a1 = (goal_point - start_point)/L
+    a1 = np.concatenate([a1, np.array([0.])], axis=0)[:,np.newaxis] # (3,1)
+    e1 = np.array([[1.0], [0.0], [0.0]])
+    M = a1 @ e1.T
+    U, _, V_T = np.linalg.svd(M, True, True)
+    C = U @ np.diag([1.0, 1.0, np.linalg.det(U) * np.linalg.det(V_T.T)]) @ V_T
+    return C
+
+def get_distance_and_angle(start_point, goal_point):
+    """
+    - inputs:
+        - start_point: np float64 (2,)
+        - goal_point: np float64 (2,)
+    """
+    dx, dy = goal_point - start_point
+    return math.hypot(dx, dy), math.atan2(dy, dx)
+
+
+def ellipsoid_point_cloud_sampling(
+    start_point,
+    goal_point,
+    max_min_ratio,
+    binary_mask,
+    n_points=1000,
+    n_raw_samples=10000,
+):
+    """
+    - inputs
+        - start_point: np (2,)
+        - goal_point: np (2,)
+        - max_min_ratio: scalar >= 1.0
+        - binary_mask: 0-1 mask (img_height, img_width)
+    - outputs
+        - point_cloud: np (n_points, 2)
+    """
+    c_min, theta = get_distance_and_angle(start_point, goal_point)
+    C = RotationToWorldFrame(start_point, goal_point, c_min)
+    x_center = (start_point+goal_point)/2.
+    x_center = np.concatenate([x_center, np.array([0.])], axis=0) # (3,)
+    c_max = c_min*max_min_ratio
+    if c_max ** 2 - c_min ** 2<0:
+        eps = 1e-6
+    else:
+        eps = 0
+    r = [c_max / 2.0,
+        math.sqrt(c_max ** 2 - c_min ** 2+eps) / 2.0,
+        math.sqrt(c_max ** 2 - c_min ** 2+eps) / 2.0]
+    L = np.diag(r)
+
+    samples = np.random.uniform(-1, 1, size=(n_raw_samples, 2))
+    samples = samples[np.linalg.norm(samples, axis=1) <= 1]
+    samples = np.concatenate([samples, np.zeros((len(samples),1))], axis=1) # (n, 3)
+
+    x_rand = np.dot(np.dot(C, L), samples.T).T + x_center
+    point_cloud = x_rand[:,:2]
+    # remove points in occupied space
+    point_cloud_pix = point_cloud.astype(int)
+    point_cloud_neighbors = []
+    for i in range(0, 2):
+        for j in range(0, 2):
+            point_cloud_neighbors.append(point_cloud_pix+np.array([i,j]))
+    pix_nei_offset = np.array([[0,0],[0,1],[1,0],[1,1]])[:,np.newaxis] # (4,1,2)
+    point_cloud_pix_nei = point_cloud_pix + pix_nei_offset # (4, n, 2)
+    point_cloud_pix_nei = point_cloud_pix_nei.reshape(-1,2)
+    img_height, img_width = binary_mask.shape
+    point_cloud_pix_nei[:,1] = np.clip(point_cloud_pix_nei[:,1], 0, img_height-1)
+    point_cloud_pix_nei[:,0] = np.clip(point_cloud_pix_nei[:,0], 0, img_width-1)
+    point_cloud_occupied_mask = np.prod(
+        binary_mask[point_cloud_pix_nei[:,1],point_cloud_pix_nei[:,0]].reshape(4,-1),
+        axis=0,
+    ) # (n,)
+    point_cloud = point_cloud[point_cloud_occupied_mask.nonzero()[0]]
+    x_range = (0, img_width)
+    y_range = (0, img_height)
+    point_cloud_in_range_mask = points_in_range(
+        point_cloud,
+        x_range,
+        y_range,
+        clearance=0,
+    )
+    point_cloud = point_cloud[point_cloud_in_range_mask]
+    if len(point_cloud) > n_points:
+        # downsample
+        point_cloud_fake_z = np.concatenate([point_cloud, np.zeros((point_cloud.shape[0],1))],axis=1) # (n,3)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(point_cloud_fake_z)
+        pcd = pcd.farthest_point_down_sample(num_samples=n_points)
+        point_cloud = np.asarray(pcd.points)[:,:2]
+    return point_cloud
+
+
+class NIRRTStarPNG2D(IRRTStar2D):
+    def __init__(
+        self,
+        x_start,
+        x_goal,
+        step_len,
+        search_radius,
+        iter_max,
+        env_dict,
+        png_wrapper,
+        binary_mask,
+        clearance,
+        pc_n_points,
+        pc_over_sample_scale,
+        pc_sample_rate,
+        pc_update_cost_ratio,
+    ):
+        RRTBase2D.__init__(
+            self,
+            x_start,
+            x_goal,
+            step_len,
+            search_radius,
+            iter_max,
+            Env(env_dict),
+            clearance,
+            "NIRRT*-PNG 2D",
+        )
+        self.png_wrapper = png_wrapper
+        self.binary_mask = binary_mask
+        self.pc_n_points = pc_n_points # * number of points in pc
+        self.pc_over_sample_scale = pc_over_sample_scale
+        self.pc_sample_rate = pc_sample_rate
+        self.pc_neighbor_radius = self.step_len
+        self.pc_update_cost_ratio = pc_update_cost_ratio
+        self.path_solutions = [] # * a list of valid goal parent vertex indices
+        self.visualizer = NIRRTStarVisualizer(self.x_start, self.x_goal, self.env)
+
+
+    def init_pc(self):
+        self.update_point_cloud(
+            cmax=np.inf,
+            cmin=None,
+        )
+        # fig, ax = plt.subplots()
+        # # 可视化预测路径点云
+        # if self.path_point_cloud_pred is not None:
+        #     ax.scatter(self.path_point_cloud_pred[:, 0], self.path_point_cloud_pred[:, 1],
+        #             c='r', label='Predicted high-value points')
+        # # 可视化其它点云
+        # if hasattr(self.visualizer, 'path_point_cloud_other') and self.visualizer.path_point_cloud_other is not None:
+        #     ax.scatter(self.visualizer.path_point_cloud_other[:, 0],
+        #             self.visualizer.path_point_cloud_other[:, 1],
+        #             c='gray', alpha=0.3, label='Other points')
+        # # 起点/终点
+        # ax.scatter(self.x_start[0], self.x_start[1], c='green', s=100, label='Start')
+        # ax.scatter(self.x_goal[0], self.x_goal[1], c='blue', s=100, label='Goal')
+
+        # ax.set_title("Point Cloud Prediction After init_pc()")
+        # ax.set_aspect('equal')
+        # ax.legend()
+        # plt.show()
+
+    def planning(self, visualize=False):
+        theta, start_goal_straightline_dist, x_center, C = self.init()
+        self.init_pc()  # 初始化点云
+        c_best = np.inf
+        c_update = c_best
+        cost_curve = []
+        start_time = time.time()  # 记录迭代开始时间
+
+        for k in range(self.iter_max):
+
+            if len(self.path_solutions) > 0:
+                c_best, x_best = self.find_best_path_solution()
+
+            node_rand, c_update = self.generate_random_node(c_best, start_goal_straightline_dist, x_center, C, c_update)
+            self.visualizer.set_current_expansion(node_rand)
+            node_nearest, node_nearest_index = self.nearest_neighbor(self.vertices[:self.num_vertices], node_rand)
+            node_new = self.new_state(node_nearest, node_rand)
+            self.visualizer.set_current_expansion_new(node_new)
+
+            if not self.utils.is_collision(node_nearest, node_new):
+                if np.linalg.norm(node_new - node_nearest) < 1e-8:
+                    node_new = node_nearest
+                    self.visualizer.set_current_expansion_new(node_new)
+                    node_new_index = node_nearest_index
+                    curr_node_new_cost = self.cost(node_nearest_index)
+                else:
+                    node_new_index = self.num_vertices
+                    self.vertices[node_new_index] = node_new
+                    self.vertex_parents[node_new_index] = node_nearest_index
+                    self.num_vertices += 1
+                    curr_node_new_cost = self.cost(node_nearest_index) + self.Line(node_nearest, node_new)
+
+                neighbor_indices = self.find_near_neighbors(node_new, node_new_index)
+                if len(neighbor_indices) > 0:
+                    self.choose_parent(node_new, neighbor_indices, node_new_index, curr_node_new_cost)
+                    self.rewire(node_new, neighbor_indices, node_new_index)
+
+                if self.InGoalRegion(node_new):
+                    self.path_solutions.append(node_new_index)
+
+            if len(self.path_solutions) > 0:
+                c_best, x_best = self.find_best_path_solution()
+                self.path = self.extract_path(x_best)
+            else:
+                self.path = []
+
+            cost_curve.append(c_best)
+            end_time = time.time()
+            planning_time = end_time - start_time
+            if k % 10 == 0:
+                print(f"Iteration {k} finished in {planning_time:.4f} seconds, current best path length: {c_best}")
+
+                # 可视化
+                if visualize:
+                    self.visualize(x_center, c_best, start_goal_straightline_dist, theta, cost_curve, iter_suffix=k)
+
+        plt.figure()
+        plt.plot(range(len(cost_curve)), cost_curve)
+        plt.xlabel("Iteration")
+        plt.ylabel("Path Cost (c_best)")
+        plt.title("Path Cost vs Iterations")
+        plt.grid(True)
+        planner_name = self.__class__.__name__
+        img_dir = os.path.join("visualization", "planning_demo", planner_name)
+        plt.savefig(os.path.join(img_dir,"path_cost_curve.png"), dpi=300)
+        plt.close()
+
+    def generate_random_node(
+        self,
+        c_curr,
+        c_min,
+        x_center,
+        C,
+        c_update,
+    ):
+        '''
+        - outputs
+            - node_rand: np (2,)
+            - c_update: scalar
+        '''
+        # * tested that np.inf < alpha*np.inf is False, alpha in (0,1]
+        if c_curr < self.pc_update_cost_ratio*c_update:
+            self.update_point_cloud(c_curr, c_min)
+            c_update = c_curr
+        if np.random.random() < self.pc_sample_rate:
+            return self.SamplePointCloud(), c_update
+        else:
+            if c_curr < np.inf:
+                return self.SampleInformedSubset(
+                    c_curr,
+                    c_min,
+                    x_center,
+                    C,
+                ), c_update
+            else:
+                return self.SampleFree(), c_update
+                
+    def SamplePointCloud(self):
+        return self.path_point_cloud_pred[np.random.randint(0,len(self.path_point_cloud_pred))]
+
+    def update_point_cloud(
+        self,
+        cmax,
+        cmin,
+    ):
+        if self.pc_sample_rate == 0:
+            self.path_point_cloud_pred = None
+            self.visualizer.set_path_point_cloud_pred(self.path_point_cloud_pred)
+            return
+        if cmax < np.inf:
+            max_min_ratio = cmax/cmin
+            pc = ellipsoid_point_cloud_sampling(
+                self.x_start,
+                self.x_goal,
+                max_min_ratio,
+                self.binary_mask,
+                self.pc_n_points,
+                n_raw_samples=self.pc_n_points*self.pc_over_sample_scale,
+            )
+        else:
+            pc = generate_rectangle_point_cloud(
+                self.binary_mask,
+                self.pc_n_points,
+                self.pc_over_sample_scale,
+            )
+        start_mask = get_point_cloud_mask_around_points(
+            pc,
+            self.x_start[np.newaxis,:],
+            self.pc_neighbor_radius,
+        ) # (n_points,)
+        goal_mask = get_point_cloud_mask_around_points(
+            pc,
+            self.x_goal[np.newaxis,:],
+            self.pc_neighbor_radius,
+        ) # (n_points,)
+        path_pred, path_score = self.png_wrapper.classify_path_points(
+            pc.astype(np.float32),
+            start_mask.astype(np.float32),
+            goal_mask.astype(np.float32),
+        )
+        self.path_point_cloud_pred = pc[path_pred.nonzero()[0]] # (<pc_n_points, 2)
+        self.visualizer.set_path_point_cloud_pred(self.path_point_cloud_pred)
+        self.visualizer.set_path_point_cloud_other(pc[np.nonzero(path_pred==0)[0]])
+
+
+    def visualize(self, x_center, c_best, start_goal_straightline_dist, theta, cost_curve, figure_title=None, img_filename=None, iter_suffix=None):
+        if figure_title is None:
+            figure_title = "nirrt* 2D"
+            if iter_suffix is not None:
+                figure_title += f", iteration {iter_suffix}"
+        if img_filename is None:
+            img_filename = f"nirrt_2d_example_{iter_suffix}.png" if iter_suffix is not None else "nirrt_2d_example.png"
+        planner_name = self.__class__.__name__
+        img_dir = os.path.join("visualization", "planning_demo", planner_name)
+        os.makedirs(img_dir, exist_ok=True)
+        img_filename = os.path.join(img_dir,img_filename)
+        self.visualizer.animation(
+            self.vertices[:self.num_vertices],
+            self.vertex_parents[:self.num_vertices],
+            self.path,
+            figure_title,
+            x_center,
+            c_best,
+            start_goal_straightline_dist,
+            theta,
+            img_filename=img_filename,
+        )
+
+    def planning_block_gap(
+        self,
+        path_len_threshold,
+    ):
+        path_len_list = []
+        theta, start_goal_straightline_dist, x_center, C = self.init()
+        self.init_pc() # * nirrt*
+        c_best = np.inf
+        c_update = c_best # * nirrt*
+        better_than_path_len_threshold = False
+        for k in range(self.iter_max):
+            if len(self.path_solutions)>0:
+                c_best, x_best = self.find_best_path_solution()
+            path_len_list.append(c_best)
+            if k % 1000 == 0:
+                print("{0}/{1} - current: {2:.2f}, threshold: {3:.2f}".format(\
+                    k, self.iter_max, c_best, path_len_threshold)) #* not k+1, because we are not getting c_best after iteration is done
+            if c_best < path_len_threshold:
+                better_than_path_len_threshold = True
+                break
+            node_rand, c_update = self.generate_random_node(c_best, start_goal_straightline_dist, x_center, C, c_update) # * nirrt*
+            node_nearest, node_nearest_index = self.nearest_neighbor(self.vertices[:self.num_vertices], node_rand)
+            node_new = self.new_state(node_nearest, node_rand)
+            if not self.utils.is_collision(node_nearest, node_new):
+                if np.linalg.norm(node_new-node_nearest)<1e-8:
+                    # * do not create a new node if it is actually the same point
+                    node_new = node_nearest
+                    node_new_index = node_nearest_index
+                    curr_node_new_cost = self.cost(node_nearest_index)
+                else:
+                    node_new_index = self.num_vertices
+                    self.vertices[node_new_index] = node_new
+                    self.vertex_parents[node_new_index] = node_nearest_index
+                    self.num_vertices += 1
+                    curr_node_new_cost = self.cost(node_nearest_index)+self.Line(node_nearest, node_new)
+                neighbor_indices = self.find_near_neighbors(node_new, node_new_index)
+                if len(neighbor_indices)>0:
+                    self.choose_parent(node_new, neighbor_indices, node_new_index, curr_node_new_cost)
+                    self.rewire(node_new, neighbor_indices, node_new_index)
+                if self.InGoalRegion(node_new):
+                    self.path_solutions.append(node_new_index)
+        path_len_list = path_len_list[1:] # * the first one is the initialized c_best before iteration
+        if better_than_path_len_threshold:
+            return path_len_list
+        # * path cost for the last iteration
+        if len(self.path_solutions)>0:
+            c_best, x_best = self.find_best_path_solution()
+        path_len_list.append(c_best)
+        print("{0}/{1} - current: {2:.2f}, threshold: {3:.2f}".format(\
+            len(path_len_list), self.iter_max, c_best, path_len_threshold)) #* not k+1, because we are not getting c_best after iteration is done
+        return path_len_list
+
+    def planning_random(
+        self,
+        iter_after_initial,
+    ):
+        path_len_list = []
+        time_list = []  # ✅ 新增：记录每次迭代时间
+        theta, start_goal_straightline_dist, x_center, C = self.init()
+        self.init_pc() # * nirrt*
+        c_best = np.inf
+        c_update = c_best # * nirrt*
+        better_than_inf = False
+        for k in range(self.iter_max):
+            t0 = time.time()  # ✅ 开始计时
+            if len(self.path_solutions)>0:
+                c_best, x_best = self.find_best_path_solution()
+            path_len_list.append(c_best)
+            if k % 1000 == 0:
+                if c_best == np.inf:
+                    print("{0}/{1} - current: inf".format(k, self.iter_max)) #* not k+1, because we are not getting c_best after iteration is done
+            if c_best < np.inf:
+                better_than_inf = True
+                print("{0}/{1} - current: {2:.2f}".format(k, self.iter_max, c_best))
+                time_list.append(time.time() - t0)  # ✅ 保存时间
+                break
+            node_rand, c_update = self.generate_random_node(c_best, start_goal_straightline_dist, x_center, C, c_update) # * nirrt*
+            node_nearest, node_nearest_index = self.nearest_neighbor(self.vertices[:self.num_vertices], node_rand)
+            node_new = self.new_state(node_nearest, node_rand)
+            if not self.utils.is_collision(node_nearest, node_new):
+                if np.linalg.norm(node_new-node_nearest)<1e-8:
+                    # * do not create a new node if it is actually the same point
+                    node_new = node_nearest
+                    node_new_index = node_nearest_index
+                    curr_node_new_cost = self.cost(node_nearest_index)
+                else:
+                    node_new_index = self.num_vertices
+                    self.vertices[node_new_index] = node_new
+                    self.vertex_parents[node_new_index] = node_nearest_index
+                    self.num_vertices += 1
+                    curr_node_new_cost = self.cost(node_nearest_index)+self.Line(node_nearest, node_new)
+                neighbor_indices = self.find_near_neighbors(node_new, node_new_index)
+                if len(neighbor_indices)>0:
+                    self.choose_parent(node_new, neighbor_indices, node_new_index, curr_node_new_cost)
+                    self.rewire(node_new, neighbor_indices, node_new_index)
+                if self.InGoalRegion(node_new):
+                    self.path_solutions.append(node_new_index)
+            time_list.append(time.time() - t0)  # ✅ 保存本次迭代时间
+        path_len_list = path_len_list[1:] # * the first one is the initialized c_best before iteration
+        time_list = time_list[1:]  # ✅ 时间列表对应裁剪
+        if better_than_inf:
+            initial_path_len = path_len_list[-1]
+        else:
+            # * path cost for the last iteration
+            if len(self.path_solutions)>0:
+                c_best, x_best = self.find_best_path_solution()
+            path_len_list.append(c_best)
+            time_list.append(0.)  # ✅ 此次耗时可以忽略
+            initial_path_len = path_len_list[-1]
+            if initial_path_len == np.inf:
+                # * fail to find initial path solution
+                return path_len_list
+        path_len_list = path_len_list[:-1] # * for loop below will add initial_path_len to path_len_list
+        # * iteration after finding initial solution
+        for k in range(iter_after_initial):
+            t0 = time.time()  # ✅ 开始计时
+            c_best, x_best = self.find_best_path_solution() # * there must be path solutions
+            path_len_list.append(c_best)
+            if k % 1000 == 0:
+                print("{0}/{1} - current: {2:.2f}, initial: {3:.2f}, cmin: {4:.2f}".format(\
+                    k, iter_after_initial, c_best, initial_path_len, start_goal_straightline_dist))
+            node_rand, c_update = self.generate_random_node(c_best, start_goal_straightline_dist, x_center, C, c_update) # * nirrt*
+            node_nearest, node_nearest_index = self.nearest_neighbor(self.vertices[:self.num_vertices], node_rand)
+            node_new = self.new_state(node_nearest, node_rand)
+            if not self.utils.is_collision(node_nearest, node_new):
+                if np.linalg.norm(node_new-node_nearest)<1e-8:
+                    # * do not create a new node if it is actually the same point
+                    node_new = node_nearest
+                    node_new_index = node_nearest_index
+                    curr_node_new_cost = self.cost(node_nearest_index)
+                else:
+                    node_new_index = self.num_vertices
+                    self.vertices[node_new_index] = node_new
+                    self.vertex_parents[node_new_index] = node_nearest_index
+                    self.num_vertices += 1
+                    curr_node_new_cost = self.cost(node_nearest_index)+self.Line(node_nearest, node_new)
+                neighbor_indices = self.find_near_neighbors(node_new, node_new_index)
+                if len(neighbor_indices)>0:
+                    self.choose_parent(node_new, neighbor_indices, node_new_index, curr_node_new_cost)
+                    self.rewire(node_new, neighbor_indices, node_new_index)
+                if self.InGoalRegion(node_new):
+                    self.path_solutions.append(node_new_index)
+            time_list.append(time.time() - t0)  # ✅ 保存时间
+        # * path cost for the last iteration
+        c_best, x_best = self.find_best_path_solution() # * there must be path solutions
+        path_len_list.append(c_best)
+        time_list.append(0.)  # ✅ 最后一次耗时忽略
+        print("{0}/{1} - current: {2:.2f}, initial: {3:.2f}".format(\
+            iter_after_initial, iter_after_initial, c_best, initial_path_len))
+        return path_len_list, time_list
+
+def get_path_planner(
+    args,
+    problem,
+    neural_wrapper,
+):
+    return NIRRTStarPNG2D(
+        problem['x_start'],
+        problem['x_goal'],
+        args.step_len,
+        problem['search_radius'],
+        args.iter_max,
+        problem['env_dict'],
+        neural_wrapper,
+        problem['binary_mask'],
+        args.clearance,
+        args.pc_n_points,
+        args.pc_over_sample_scale,
+        args.pc_sample_rate,
+        args.pc_update_cost_ratio,
+    )
+
+
+    
