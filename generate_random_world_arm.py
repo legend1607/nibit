@@ -80,7 +80,7 @@ def generate_single_env(env_idx, config):
     # 随机障碍
     obstacles = add_random_obstacles(env, config)
 
-    for _ in range(config["num_samples_per_env"]):
+    for num_sample in range(config["num_samples_per_env"]):
         problem = env.set_random_init_goal()
         if problem["start"] is None or problem["goal"] is None:
             env.close()
@@ -93,9 +93,9 @@ def generate_single_env(env_idx, config):
 
         # 使用 BITStar 规划
         planner = BITStar(start=start, goal=goal, environment=env,
-                          iter_max=500, pc_n_points=config.get("batch_size", 500),
+                          iter_max=1000, batch_size=config.get("batch_size", 200), pc_n_points=config.get("pc_n_points", 2048),
                           plot_flag=False)
-        print("开始路径规划...")
+        print(f"{num_sample}")
         planner.planning(visualize=False)
         path = planner.get_best_path()
 
@@ -133,7 +133,7 @@ def generate_env_dataset_single(config):
         "val": config["val_env_size"],
         "test": config["test_env_size"],
     }
-    for mode in ["train", "val", "test"]:  # ✅ 改 "eval" → "val"
+    for mode in ["test"]:  
         data_dir = join("data", f"{env_type}", f"{mode}")
         os.makedirs(data_dir, exist_ok=True)
         path_dir = join(data_dir, "paths")
@@ -141,47 +141,45 @@ def generate_env_dataset_single(config):
 
         env_list = []
         env_idx = 0
-        success_count = 0
 
         print(f"开始生成 [{mode}] 环境目标数: {target_sizes[mode]}")
 
         # ✅ 持续尝试直到达到目标数量
-        while success_count < target_sizes[mode]:
+        while env_idx < target_sizes[mode]:
             env_dict = generate_single_env(env_idx, config)
-            env_idx += 1  # 无论成功与否，索引递增方便日志跟踪
 
             if env_dict is None:
                 continue  # 无效环境，重试
 
             env_list.append(env_dict)
-            success_count += 1
+            env_idx += 1  
 
             # 保存每个环境的数据
             for i, path in enumerate(env_dict["paths"]):
-                np.savetxt(join(path_dir, f"{success_count-1}_{i}.txt"),
+                np.savetxt(join(path_dir, f"{env_idx}_{i}.txt"),
                            np.array(path), fmt="%.4f", delimiter=",")
 
             with open(join(data_dir, "envs.json"), "w") as f:
                 json.dump(env_list, f, indent=2)
 
-            print(f"[{mode}] ✅ 已生成 {success_count}/{target_sizes[mode]} 个环境")
+            print(f"[{mode}] ✅ 已生成 {env_idx+1}/{target_sizes[mode]} 个环境")
     print(f"[{mode}] ✅ 完成，共 {len(env_list)} 个有效环境")
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
     config = {
         "env_type": "liche",  # "kuka" 或 "ur5" 或 "liche"
-        "train_env_size": 2,
+        "train_env_size": 5,
         "val_env_size": 2,
-        "test_env_size": 2,
-        "num_samples_per_env": 2,
+        "test_env_size": 20,
+        "num_samples_per_env": 5,
         "batch_size": 200,
         "GUI": False,
         # 随机障碍物配置
-        "xyz_max": [2, 2, 2],
+        "xyz_max": [3, 3, 2],
         "box_size_range": [0.1, 1],
         "ball_radius_range": [0.1, 0.2],
-        "num_boxes_range": [0, 5],
+        "num_boxes_range": [1, 8],
         "num_balls_range": [0, 5]
     }
     generate_env_dataset_single(config)

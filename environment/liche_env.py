@@ -47,7 +47,7 @@ class LicheEnv:
     """
 
     EPS: float = 0.05
-    RRT_EPS: float = 0.5
+    RRT_EPS: float = 0.05
 
     def __init__(self, GUI: bool = False, arm_file: str = "liche/urdf/liche.urdf"):
         """
@@ -72,8 +72,8 @@ class LicheEnv:
             p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
             p.resetDebugVisualizerCamera(
-                cameraDistance=1.5, cameraYaw=30, cameraPitch=-40,
-                cameraTargetPosition=[0, 0, 0.5]
+                cameraDistance=3, cameraYaw=-90, cameraPitch=-40,
+                cameraTargetPosition=[0, 1, 0]
             )
         else:
             p.connect(p.DIRECT)
@@ -435,8 +435,8 @@ class LicheEnv:
         gradient: bool = False,
         show_robots: bool = True,
         pose_interval: int = 10,
-        sleep_interval: float = 0.02,
-        interp_step: float = 0.1
+        sleep_interval: float = 0.05,
+        interp_step: float = 0.05
     ) -> None:
         """
         渲染路径（带插值、渐变、半透明机械臂显示）

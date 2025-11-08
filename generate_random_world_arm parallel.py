@@ -77,63 +77,72 @@ def visualize_env_task(env, pause_time=1.0):
 def generate_single_env(args):
     env_idx, config = args
 
-    try:
-        if config["env_type"] == "ur5":
-            env = UR5Env(GUI=config.get("GUI", False))
-        elif config["env_type"] == "kuka":
-            env = KukaEnv(GUI=config.get("GUI", False))
-        elif config["env_type"] == "liche":
-            env = LicheEnv(GUI=config.get("GUI", False))
-        else:
-            raise ValueError(f"未知的环境类型: {config['env_type']}")
-
+    while True:  # 无限循环直到生成至少一条路径
         path_list, start_list, goal_list = [], [], []
-        obstacles = add_random_obstacles(env, config)
+        try:
+            # 初始化环境
+            if config["env_type"] == "ur5":
+                env = UR5Env(GUI=config.get("GUI", False))
+            elif config["env_type"] == "kuka":
+                env = KukaEnv(GUI=config.get("GUI", False))
+            elif config["env_type"] == "liche":
+                env = LicheEnv(GUI=config.get("GUI", False))
+            else:
+                raise ValueError(f"未知的环境类型: {config['env_type']}")
 
-        for sample in range(config["num_samples_per_env"]):
-            problem = env.set_random_init_goal()
-            if problem["start"] is None or problem["goal"] is None:
-                continue
-            start, goal = problem["start"], problem["goal"]
+            # 添加随机障碍
+            obstacles = add_random_obstacles(env, config)
 
-            planner = BITStar(start=start, goal=goal, environment=env,
-                              iter_max=500, pc_n_points=config.get("batch_size", 500),
-                              plot_flag=False)
-            planner.planning(visualize=False)
-            path = planner.get_best_path()
+            # 生成路径
+            for sample in range(config["num_samples_per_env"]):
+                problem = env.set_random_init_goal()
+                if problem["start"] is None or problem["goal"] is None:
+                    continue
+                start, goal = problem["start"], problem["goal"]
 
-            if path is None or len(path) == 0:
-                continue
+                planner = BITStar(start=start, goal=goal, environment=env,
+                                  iter_max=1000, batch_size=config.get("batch_size", 200), pc_n_points=config.get("pc_n_points", 2048),
+                                  plot_flag=False)
+                planner.planning(visualize=False)
+                path = planner.get_best_path()
 
-            path_list.append(path)
-            start_list.append(start)
-            goal_list.append(goal)
-        # print(f"[Env {env_idx}] completed")
+                if path is None or len(path) == 0:
+                    continue
 
-        if len(path_list) == 0:
+                path_list.append(path)
+                start_list.append(start)
+                goal_list.append(goal)
+
+            if path_list:  # 至少生成一条路径
+                # print(f"[Env {env_idx}] completed")
+                env_dict = {
+                    "env_idx": env_idx,
+                    "config_dim": env.config_dim,
+                    "bound": env.bound.tolist(),
+                    "start": [s.tolist() for s in start_list],
+                    "goal": [g.tolist() for g in goal_list],
+                    "paths": [np.array(p).tolist() for p in path_list],
+                    "obstacles": obstacles
+                }
+                env.close()
+                return env_dict
+
+            # 如果没有生成路径，重新循环
             env.close()
-            return None
 
-        env_dict = {
-            "env_idx": env_idx,
-            "config_dim": env.config_dim,
-            "bound": env.bound.tolist(),
-            "start": [s.tolist() for s in start_list],
-            "goal": [g.tolist() for g in goal_list],
-            "paths": [np.array(p).tolist() for p in path_list],
-            "obstacles": obstacles
-        }
-
-        env.close()
-        return env_dict
-
-    except Exception as e:
-        print(f"[Env {env_idx}]  生成失败: {e}")
-        return None
-
+        except Exception as e:
+            # print(f"[Env {env_idx}] 生成失败: {e}")
+            try:
+                env.close()
+            except:
+                pass
+            # 继续循环，保持无限重试
 
 # ---------------- 数据集生成（并行 + 自动保证数量） ----------------
 from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+import os, json, numpy as np
+from os.path import join
 
 def generate_env_dataset_parallel(config):
     env_type = config.get("env_type", "kuka")
@@ -146,59 +155,57 @@ def generate_env_dataset_parallel(config):
     num_workers = max(1, min(cpu_count(), config.get("num_workers", cpu_count())))
     print(f"🧩 使用 {num_workers} 个并行进程")
 
-    for mode in ["train"," val", "test"]:
+    for mode in ["test"]:
         data_dir = join("data", env_type, mode)
         os.makedirs(data_dir, exist_ok=True)
         path_dir = join(data_dir, "paths")
         os.makedirs(path_dir, exist_ok=True)
 
-        env_list = []
-        success_count = 0
-        attempt_idx = 0
+        env_list = [None] * target_sizes[mode]  # 预分配列表，保持顺序
         target_num = target_sizes[mode]
+        success_count = 0
 
         print(f"\n=== 开始生成 [{mode}] 数据集，目标数量：{target_num} ===")
+        pbar = tqdm(total=target_num)
+
+        # 构建任务列表
+        tasks = [(idx, config) for idx in range(target_num)]
 
         with Pool(processes=num_workers) as pool:
-            # 用 imap_unordered 每完成一个任务就返回结果
-            tasks = ((attempt_idx + i, config) for i in range(target_num))
-            for env_dict in tqdm(pool.imap_unordered(generate_single_env, tasks), total=target_num):
-                attempt_idx += 1
-                if env_dict is None:
-                    continue
-
-                env_list.append(env_dict)
+            for env_dict in pool.imap_unordered(generate_single_env, tasks):
+                env_idx = env_dict["env_idx"]
+                env_list[env_idx] = env_dict
                 success_count += 1
+                pbar.update(1)
 
-                # 保存每个环境内部的每条路径
-                env_idx = success_count - 1
+                # 保存路径
                 for i, path in enumerate(env_dict["paths"]):
                     np.savetxt(join(path_dir, f"{env_idx}_{i}.txt"),
                                np.array(path), fmt="%.4f", delimiter=",")
 
-                # 每生成 1 个环境就更新 JSON
-                with open(join(data_dir, "envs.json"), "w") as f:
-                    json.dump(env_list, f, indent=2)
+        # 生成完成后统一保存 JSON
+        with open(join(data_dir, "envs.json"), "w") as f:
+            json.dump(env_list, f, indent=2)
 
+        pbar.close()
         print(f"[{mode}] ✅ 生成完成，共 {success_count} 个有效环境")
-
 
 # ---------------- 主函数 ----------------
 if __name__ == "__main__":
     config = {
         "env_type": "liche",  # "kuka" 或 "ur5" 或 "liche"
-        "train_env_size": 10,
+        "train_env_size": 5,
         "val_env_size": 2,
-        "test_env_size": 2,
-        "num_samples_per_env": 2,
+        "test_env_size": 100,
+        "num_samples_per_env": 5,
         "batch_size": 200,
         "GUI": False,
         "num_workers": 4,  # 可根据CPU调整
         # 随机障碍物配置
-        "xyz_max": [5, 5, 2],
+        "xyz_max": [4, 4, 2],
         "box_size_range": [0.1, 1],
         "ball_radius_range": [0.1, 0.2],
-        "num_boxes_range": [0, 5],
+        "num_boxes_range": [1, 8],
         "num_balls_range": [0, 5],
     }
 

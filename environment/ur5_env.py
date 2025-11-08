@@ -392,6 +392,11 @@ class UR5Env:
             self.goal = self.sample_empty_points()
         return self.get_problem()
 
+    def set_init_goal(self,start,goal) -> Dict[str, Any]:
+        """随机生成有效的 start / goal（不会太接近）"""
+        self.start =start
+        self.goal = goal
+
     def in_goal_region(self, state: Sequence[float], eps: float = EPS) -> bool:
         """判断是否到达目标（并且当前状态也是无碰撞）"""
         if self.goal is None:

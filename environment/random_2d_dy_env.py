@@ -110,7 +110,8 @@ class Random2DKinodynamicEnv:
         for i in range(steps + 1):
             t = i / steps
             # 双积分公式
-            pos = pos0 + state[2:] * t * dt + 0.5 * (new_state[2:] - state[2:]) * (t*dt)**2 / dt
+            acc = (new_state[2:] - state[2:]) / dt
+            pos = pos0 + state[2:] * t * dt + 0.5 * acc * (t*dt)**2
             if not self._point_in_free_space(pos):
                 return False
         return True

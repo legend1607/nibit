@@ -20,11 +20,35 @@ import torch
 import random
 INF = float("inf")
 
-class BITStar:
+def get_point_cloud_mask_around_points(point_cloud, points, neighbor_radius=3):
+    """
+    - 自动支持 point_cloud 和 points 的任意维度
+    - point_cloud: (n, C)
+    - points: (m, C)
+    - neighbor_radius: 半径阈值
+    """
+    point_cloud = np.asarray(point_cloud)
+    points = np.asarray(points)
+
+    # 检查维度一致
+    assert point_cloud.shape[1] == points.shape[1], "point_cloud 和 points 维度不一致"
+
+    # 计算欧氏距离
+    diff = point_cloud[:, np.newaxis, :] - points[np.newaxis, :, :]  # (n, m, C)
+    dist = np.linalg.norm(diff, axis=2)  # (n, m)
+
+    # 判断是否在邻域半径内
+    neighbor_mask = dist < neighbor_radius  # (n, m)
+    around_points_mask = np.any(neighbor_mask, axis=1)  # (n,)
+
+    return around_points_mask
+
+class NBITStar:
     def __init__(self, 
                 start,
                 goal,
-                environment, 
+                environment,
+                neural_wrapper,
                 iter_max, 
                 batch_size,
                 pc_n_points, 
@@ -35,6 +59,7 @@ class BITStar:
             self.timer = timer
 
         self.env = environment
+        self.neural_wrapper = neural_wrapper
 
         # ---------- 关键：统一将 start/goal 转为可哈希 key ----------
         # 使用 tuple 且对浮点做适度舍入以避免微小差异导致 key 不匹配
@@ -170,14 +195,17 @@ class BITStar:
         x = r * u / norm
         return x
 
-    def sample_from_env(self, c_best, batch_size, vertices=None):
+    def sample_from_env(self, c_best, batch_size, vertices=None, bias_ratio=0.5):
         """
-        从椭圆域中进行 informed 采样。返回 list of tuple keys。
-        若 c_best 无效，则回退为在环境中均匀采样（调用 env.sample_empty_points）。
+        生成固定 pc_n_points 个候选点作为点云输入网络，
+        然后从网络预测的高概率点中按总分排序选择一部分，
+        剩余通过椭圆/单位球采样补齐。
         """
         samples = []
 
-        # --- 回退到 uniform 采样 ---
+        # --- 1️⃣ 生成固定候选点 ---
+        candidate_points = []
+
         if (
             c_best is None
             or not np.isfinite(c_best)
@@ -186,30 +214,80 @@ class BITStar:
             or self.center_point is None
             or self.C is None
         ):
-            for _ in range(batch_size):
+            for _ in range(self.pc_n_points):
                 p = self.env.sample_empty_points()  # 返回 ndarray
-                samples.append(self.to_key(p))
-            return samples
+                candidate_points.append(self.to_key(p))
+        else:
+            # 椭圆采样
+            a = c_best / 2.0
+            b = math.sqrt(max(0.0, c_best**2 - self.c_min**2)) / 2.0
+            L = np.diag([a] + [b] * (self.dimension - 1))
+            while len(candidate_points) < self.pc_n_points:
+                x_ball = self.sample_unit_ball()
+                x_ellipsoid = self.C @ (L @ x_ball) + self.center_point
+                try:
+                    if self.env._point_in_free_space(x_ellipsoid):
+                        candidate_points.append(x_ellipsoid)
+                except Exception:
+                    continue
 
-        # --- 椭圆参数 ---
-        a = c_best / 2.0
-        b = math.sqrt(max(0.0, c_best**2 - self.c_min**2)) / 2.0
-        L = np.diag([a] + [b] * (self.dimension - 1))
+        candidate_points = np.array(candidate_points)
 
-        # --- 椭圆采样 ---
-        while len(samples) < batch_size:
-            x_ball = self.sample_unit_ball()  # 单位球采样
-            # 从椭圆采样空间变换回真实坐标（numpy array）
-            x_ellipsoid = self.C @ (L @ x_ball) + self.center_point
+        # --- 2️⃣ 网络预测并选择 top n_bias 点 ---
+        if self.neural_wrapper is not None:
+            start_mask = get_point_cloud_mask_around_points(
+                candidate_points,
+                np.array([self.start]),
+                neighbor_radius=0.1
+            )
+            goal_mask = get_point_cloud_mask_around_points(
+                candidate_points,
+                np.array([self.goal]),
+                neighbor_radius=0.1
+            )
 
-            # 检查碰撞（传递完整维度到 env._point_in_free_space）
+            path_score, keypoint_score = self.neural_wrapper.classify_path_points(
+                candidate_points.astype(np.float32),
+                start_mask.astype(np.float32),
+                goal_mask.astype(np.float32)
+            )
+
+            # 按总分排序
+            combined_score = path_score + keypoint_score
+            sorted_idx = np.argsort(-combined_score)  # 降序
+            n_bias = int(batch_size * bias_ratio)
+            n_bias = min(n_bias, len(candidate_points))
+            if n_bias > 0:
+                top_idx = sorted_idx[:n_bias]
+                selected_predicted = candidate_points[top_idx]
+                samples.extend([self.to_key(p) for p in selected_predicted])
+                self.predicted_points = [self.to_key(p) for p in selected_predicted]
+
+        # --- 3️⃣ 剩余通过采样补齐 ---
+        n_remaining = batch_size - len(samples)
+        while n_remaining > 0:
+            if (
+                c_best is not None
+                and np.isfinite(c_best)
+                and self.C is not None
+                and self.center_point is not None
+            ):
+                # 椭圆采样
+                a = c_best / 2.0
+                b = math.sqrt(max(0.0, c_best**2 - self.c_min**2)) / 2.0
+                L = np.diag([a] + [b] * (self.dimension - 1))
+                x_ball = self.sample_unit_ball()
+                x_sample = self.C @ (L @ x_ball) + self.center_point
+            else:
+                # 全局均匀采样
+                x_sample = self.env.sample_empty_points()
+
             try:
-                if self.env._point_in_free_space(x_ellipsoid):
-                    samples.append(self.to_key(x_ellipsoid))
+                if self.env._point_in_free_space(x_sample):
+                    samples.append(self.to_key(x_sample))
+                    n_remaining -= 1
             except Exception:
-                # 如果 env 的检测只支持 discrete/2D 等，回退成 uniform 采样
-                p = self.env.sample_empty_points()
-                samples.append(self.to_key(p))
+                continue
 
         return samples
 
@@ -436,7 +514,7 @@ class BITStar:
             if direct_free:
                 current_len = self.path_length_calculate(self.path) if len(self.path) > 1 else INF
                 straight_len = self.distance(self.start, self.goal)
-                if abs(current_len - straight_len) <= 1e-8:
+                if abs(current_len - straight_len) <= 1e-5:
                     print("起点终点差", current_len-straight_len)
                     break
                 
@@ -456,10 +534,11 @@ def get_bit_planner(
     problem,
     neural_wrapper=None,
 ):
-    planner = BITStar(
+    planner = NBITStar(
         problem["start"],
         problem["goal"],
         problem['env'],
+        neural_wrapper,
         args.iter_max,
         args.batch_size,
         args.pc_n_points,

@@ -1,0 +1,244 @@
+2025-11-07 18:11:52,435 Training random_pointnet2ce_2d with seed 42
+2025-11-07 18:11:52,827 Loaded train=3978, val=497
+2025-11-07 18:11:53,681 
+Epoch [1/200] --------------------------
+2025-11-07 18:12:50,772 Training random_pointnet2ce_2d with seed 42
+2025-11-07 18:12:51,154 Loaded train=3978, val=497
+2025-11-07 18:12:51,858 
+Epoch [1/200] --------------------------
+2025-11-07 18:13:13,183 Training random_pointnet2ce_2d with seed 42
+2025-11-07 18:13:13,581 Loaded train=3978, val=497
+2025-11-07 18:13:14,284 
+Epoch [1/200] --------------------------
+2025-11-07 18:13:34,526 Training random_pointnet2ce_2d with seed 42
+2025-11-07 18:13:34,912 Loaded train=3978, val=497
+2025-11-07 18:13:35,659 
+Epoch [1/200] --------------------------
+2025-11-07 18:14:39,711 Train Loss: Total=1.070807, Path=0.518309, Keypoint=0.552498
+2025-11-07 18:22:53,792 Training random_pointnet2ce_2d with seed 42
+2025-11-07 18:22:54,156 Loaded train=3978, val=497
+2025-11-07 18:22:54,855 
+Epoch [1/200] --------------------------
+2025-11-07 18:23:58,537 Train Loss: Total=1.073270, Path=0.519586, Keypoint=0.553684
+2025-11-07 18:24:06,608 [Val] Loss_Total=0.918991  Loss_Path=0.440314  Loss_Key=0.478677  PathIoU=0.2538  KeyIoU=0.1640  Score=0.2179
+2025-11-07 18:24:06,666 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2179)
+2025-11-07 18:24:06,667 
+Epoch [2/200] --------------------------
+2025-11-07 18:25:09,539 Train Loss: Total=0.918814, Path=0.438354, Keypoint=0.480461
+2025-11-07 18:25:17,560 [Val] Loss_Total=0.909868  Loss_Path=0.429537  Loss_Key=0.480331  PathIoU=0.2513  KeyIoU=0.1602  Score=0.2148
+2025-11-07 18:25:17,560 
+Epoch [3/200] --------------------------
+2025-11-07 18:26:19,842 Train Loss: Total=0.897726, Path=0.428017, Keypoint=0.469709
+2025-11-07 18:26:27,909 [Val] Loss_Total=0.880264  Loss_Path=0.418116  Loss_Key=0.462148  PathIoU=0.2559  KeyIoU=0.1655  Score=0.2197
+2025-11-07 18:26:27,970 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2197)
+2025-11-07 18:26:27,970 
+Epoch [4/200] --------------------------
+2025-11-07 18:27:30,211 Train Loss: Total=0.886592, Path=0.422242, Keypoint=0.464350
+2025-11-07 18:27:38,139 [Val] Loss_Total=0.887717  Loss_Path=0.423540  Loss_Key=0.464178  PathIoU=0.2518  KeyIoU=0.1641  Score=0.2167
+2025-11-07 18:27:38,139 
+Epoch [5/200] --------------------------
+2025-11-07 18:28:40,531 Train Loss: Total=0.886380, Path=0.422341, Keypoint=0.464038
+2025-11-07 18:28:48,482 [Val] Loss_Total=0.873024  Loss_Path=0.414277  Loss_Key=0.458747  PathIoU=0.2534  KeyIoU=0.1648  Score=0.2179
+2025-11-07 18:28:48,483 
+Epoch [6/200] --------------------------
+2025-11-07 18:29:50,608 Train Loss: Total=0.874638, Path=0.416383, Keypoint=0.458255
+2025-11-07 18:29:58,489 [Val] Loss_Total=0.879818  Loss_Path=0.416573  Loss_Key=0.463245  PathIoU=0.2540  KeyIoU=0.1640  Score=0.2180
+2025-11-07 18:29:58,490 
+Epoch [7/200] --------------------------
+2025-11-07 18:31:00,499 Train Loss: Total=0.865595, Path=0.411961, Keypoint=0.453634
+2025-11-07 18:31:08,389 [Val] Loss_Total=0.890397  Loss_Path=0.420484  Loss_Key=0.469914  PathIoU=0.2530  KeyIoU=0.1629  Score=0.2170
+2025-11-07 18:31:08,390 
+Epoch [8/200] --------------------------
+2025-11-07 18:32:10,626 Train Loss: Total=0.873441, Path=0.415294, Keypoint=0.458147
+2025-11-07 18:32:18,569 [Val] Loss_Total=0.904426  Loss_Path=0.430427  Loss_Key=0.473998  PathIoU=0.2535  KeyIoU=0.1635  Score=0.2175
+2025-11-07 18:32:18,569 
+Epoch [9/200] --------------------------
+2025-11-07 18:33:20,769 Train Loss: Total=0.864984, Path=0.411326, Keypoint=0.453658
+2025-11-07 18:33:28,823 [Val] Loss_Total=0.866055  Loss_Path=0.411311  Loss_Key=0.454744  PathIoU=0.2554  KeyIoU=0.1666  Score=0.2199
+2025-11-07 18:33:28,882 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2199)
+2025-11-07 18:33:28,882 
+Epoch [10/200] --------------------------
+2025-11-07 18:34:30,885 Train Loss: Total=0.859370, Path=0.408882, Keypoint=0.450488
+2025-11-07 18:34:38,864 [Val] Loss_Total=0.843757  Loss_Path=0.398984  Loss_Key=0.444773  PathIoU=0.2563  KeyIoU=0.1671  Score=0.2206
+2025-11-07 18:34:38,927 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2206)
+2025-11-07 18:34:38,927 
+Epoch [11/200] --------------------------
+2025-11-07 18:35:41,426 Train Loss: Total=0.859072, Path=0.408478, Keypoint=0.450595
+2025-11-07 18:35:49,367 [Val] Loss_Total=0.854245  Loss_Path=0.408133  Loss_Key=0.446112  PathIoU=0.2574  KeyIoU=0.1686  Score=0.2219
+2025-11-07 18:35:49,427 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2219)
+2025-11-07 18:35:49,428 
+Epoch [12/200] --------------------------
+2025-11-07 18:36:51,494 Train Loss: Total=0.852270, Path=0.405145, Keypoint=0.447125
+2025-11-07 18:36:59,486 [Val] Loss_Total=0.842489  Loss_Path=0.398582  Loss_Key=0.443907  PathIoU=0.2566  KeyIoU=0.1675  Score=0.2210
+2025-11-07 18:36:59,487 
+Epoch [13/200] --------------------------
+2025-11-07 18:38:01,587 Train Loss: Total=0.838709, Path=0.398642, Keypoint=0.440067
+2025-11-07 18:38:09,517 [Val] Loss_Total=0.871174  Loss_Path=0.413447  Loss_Key=0.457726  PathIoU=0.2523  KeyIoU=0.1647  Score=0.2173
+2025-11-07 18:38:09,517 
+Epoch [14/200] --------------------------
+2025-11-07 18:39:11,687 Train Loss: Total=0.829585, Path=0.393879, Keypoint=0.435706
+2025-11-07 18:39:19,616 [Val] Loss_Total=0.845867  Loss_Path=0.402371  Loss_Key=0.443496  PathIoU=0.2579  KeyIoU=0.1690  Score=0.2224
+2025-11-07 18:39:19,675 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2224)
+2025-11-07 18:39:19,675 
+Epoch [15/200] --------------------------
+2025-11-07 18:40:22,086 Train Loss: Total=0.837539, Path=0.398258, Keypoint=0.439281
+2025-11-07 18:40:30,103 [Val] Loss_Total=0.843368  Loss_Path=0.401833  Loss_Key=0.441535  PathIoU=0.2578  KeyIoU=0.1686  Score=0.2221
+2025-11-07 18:40:30,103 
+Epoch [16/200] --------------------------
+2025-11-07 18:41:32,769 Train Loss: Total=0.832772, Path=0.395518, Keypoint=0.437253
+2025-11-07 18:41:40,755 [Val] Loss_Total=0.813447  Loss_Path=0.384390  Loss_Key=0.429057  PathIoU=0.2564  KeyIoU=0.1682  Score=0.2211
+2025-11-07 18:41:40,755 
+Epoch [17/200] --------------------------
+2025-11-07 18:42:43,419 Train Loss: Total=0.816088, Path=0.386929, Keypoint=0.429158
+2025-11-07 18:42:51,464 [Val] Loss_Total=0.868838  Loss_Path=0.414886  Loss_Key=0.453952  PathIoU=0.2544  KeyIoU=0.1656  Score=0.2189
+2025-11-07 18:42:51,464 
+Epoch [18/200] --------------------------
+2025-11-07 18:43:53,825 Train Loss: Total=0.822721, Path=0.390548, Keypoint=0.432173
+2025-11-07 18:44:01,803 [Val] Loss_Total=0.815795  Loss_Path=0.385301  Loss_Key=0.430494  PathIoU=0.2576  KeyIoU=0.1689  Score=0.2221
+2025-11-07 18:44:01,803 
+Epoch [19/200] --------------------------
+2025-11-07 18:45:04,182 Train Loss: Total=0.814004, Path=0.386126, Keypoint=0.427878
+2025-11-07 18:45:12,111 [Val] Loss_Total=0.857784  Loss_Path=0.406935  Loss_Key=0.450849  PathIoU=0.2537  KeyIoU=0.1651  Score=0.2183
+2025-11-07 18:45:12,111 
+Epoch [20/200] --------------------------
+2025-11-07 18:46:14,604 Train Loss: Total=0.803518, Path=0.380699, Keypoint=0.422819
+2025-11-07 18:46:22,515 [Val] Loss_Total=0.848957  Loss_Path=0.403544  Loss_Key=0.445412  PathIoU=0.2567  KeyIoU=0.1684  Score=0.2213
+2025-11-07 18:46:22,516 
+Epoch [21/200] --------------------------
+2025-11-07 18:47:24,887 Train Loss: Total=0.812896, Path=0.385429, Keypoint=0.427467
+2025-11-07 18:47:32,892 [Val] Loss_Total=0.819306  Loss_Path=0.388072  Loss_Key=0.431234  PathIoU=0.2572  KeyIoU=0.1686  Score=0.2218
+2025-11-07 18:47:32,892 
+Epoch [22/200] --------------------------
+2025-11-07 18:48:35,100 Train Loss: Total=0.803881, Path=0.380606, Keypoint=0.423275
+2025-11-07 18:48:43,055 [Val] Loss_Total=0.869690  Loss_Path=0.412435  Loss_Key=0.457256  PathIoU=0.2542  KeyIoU=0.1638  Score=0.2181
+2025-11-07 18:48:43,055 
+Epoch [23/200] --------------------------
+2025-11-07 18:49:45,661 Train Loss: Total=0.808016, Path=0.382977, Keypoint=0.425039
+2025-11-07 18:49:53,676 [Val] Loss_Total=0.807071  Loss_Path=0.379161  Loss_Key=0.427910  PathIoU=0.2571  KeyIoU=0.1684  Score=0.2216
+2025-11-07 18:49:53,676 
+Epoch [24/200] --------------------------
+2025-11-07 18:50:55,985 Train Loss: Total=0.798818, Path=0.378218, Keypoint=0.420599
+2025-11-07 18:51:03,953 [Val] Loss_Total=0.850696  Loss_Path=0.402602  Loss_Key=0.448094  PathIoU=0.2546  KeyIoU=0.1659  Score=0.2191
+2025-11-07 18:51:03,953 
+Epoch [25/200] --------------------------
+2025-11-07 18:52:06,267 Train Loss: Total=0.793224, Path=0.375357, Keypoint=0.417866
+2025-11-07 18:52:14,223 [Val] Loss_Total=0.819266  Loss_Path=0.387946  Loss_Key=0.431319  PathIoU=0.2564  KeyIoU=0.1677  Score=0.2209
+2025-11-07 18:52:14,223 
+Epoch [26/200] --------------------------
+2025-11-07 18:53:16,861 Train Loss: Total=0.797559, Path=0.377704, Keypoint=0.419855
+2025-11-07 18:53:24,804 [Val] Loss_Total=0.819698  Loss_Path=0.387021  Loss_Key=0.432678  PathIoU=0.2577  KeyIoU=0.1688  Score=0.2221
+2025-11-07 18:53:24,805 
+Epoch [27/200] --------------------------
+2025-11-07 18:54:27,274 Train Loss: Total=0.809327, Path=0.383438, Keypoint=0.425889
+2025-11-07 18:54:35,211 [Val] Loss_Total=0.820326  Loss_Path=0.388647  Loss_Key=0.431679  PathIoU=0.2550  KeyIoU=0.1661  Score=0.2194
+2025-11-07 18:54:35,211 
+Epoch [28/200] --------------------------
+2025-11-07 18:55:37,604 Train Loss: Total=0.795139, Path=0.376423, Keypoint=0.418716
+2025-11-07 18:55:45,573 [Val] Loss_Total=0.817237  Loss_Path=0.386593  Loss_Key=0.430644  PathIoU=0.2554  KeyIoU=0.1671  Score=0.2201
+2025-11-07 18:55:45,573 
+Epoch [29/200] --------------------------
+2025-11-07 18:56:47,980 Train Loss: Total=0.783096, Path=0.370267, Keypoint=0.412828
+2025-11-07 18:56:55,985 [Val] Loss_Total=0.814265  Loss_Path=0.384558  Loss_Key=0.429707  PathIoU=0.2558  KeyIoU=0.1673  Score=0.2204
+2025-11-07 18:56:55,986 
+Epoch [30/200] --------------------------
+2025-11-07 18:57:58,277 Train Loss: Total=0.792037, Path=0.374929, Keypoint=0.417108
+2025-11-07 18:58:06,202 [Val] Loss_Total=0.810849  Loss_Path=0.382377  Loss_Key=0.428472  PathIoU=0.2549  KeyIoU=0.1667  Score=0.2196
+2025-11-07 18:58:06,202 
+Epoch [31/200] --------------------------
+2025-11-07 18:59:08,953 Train Loss: Total=0.786892, Path=0.372299, Keypoint=0.414593
+2025-11-07 18:59:17,000 [Val] Loss_Total=0.806128  Loss_Path=0.380992  Loss_Key=0.425137  PathIoU=0.2576  KeyIoU=0.1693  Score=0.2223
+2025-11-07 18:59:17,001 
+Epoch [32/200] --------------------------
+2025-11-07 19:00:19,323 Train Loss: Total=0.794698, Path=0.376058, Keypoint=0.418640
+2025-11-07 19:00:27,186 [Val] Loss_Total=0.801020  Loss_Path=0.378553  Loss_Key=0.422467  PathIoU=0.2557  KeyIoU=0.1675  Score=0.2204
+2025-11-07 19:00:27,187 
+Epoch [33/200] --------------------------
+2025-11-07 19:01:29,684 Train Loss: Total=0.786567, Path=0.371820, Keypoint=0.414747
+2025-11-07 19:01:37,625 [Val] Loss_Total=0.816265  Loss_Path=0.386036  Loss_Key=0.430229  PathIoU=0.2576  KeyIoU=0.1691  Score=0.2222
+2025-11-07 19:01:37,625 
+Epoch [34/200] --------------------------
+2025-11-07 19:02:39,888 Train Loss: Total=0.782579, Path=0.370198, Keypoint=0.412381
+2025-11-07 19:02:47,921 [Val] Loss_Total=0.819115  Loss_Path=0.388576  Loss_Key=0.430539  PathIoU=0.2565  KeyIoU=0.1686  Score=0.2213
+2025-11-07 19:02:47,921 
+Epoch [35/200] --------------------------
+2025-11-07 19:03:50,363 Train Loss: Total=0.779767, Path=0.368602, Keypoint=0.411165
+2025-11-07 19:03:58,323 [Val] Loss_Total=0.808954  Loss_Path=0.381937  Loss_Key=0.427017  PathIoU=0.2594  KeyIoU=0.1701  Score=0.2236
+2025-11-07 19:03:58,384 ✅ Saved best model to results/random_pointnet2ce_2d/checkpoints/best_random_pointnet2ce_2d.pth (score=0.2236)
+2025-11-07 19:03:58,384 
+Epoch [36/200] --------------------------
+2025-11-07 19:05:00,583 Train Loss: Total=0.780028, Path=0.368696, Keypoint=0.411332
+2025-11-07 19:05:08,560 [Val] Loss_Total=0.809470  Loss_Path=0.382960  Loss_Key=0.426510  PathIoU=0.2561  KeyIoU=0.1679  Score=0.2208
+2025-11-07 19:05:08,561 
+Epoch [37/200] --------------------------
+2025-11-07 19:06:11,162 Train Loss: Total=0.782351, Path=0.369644, Keypoint=0.412707
+2025-11-07 19:06:19,169 [Val] Loss_Total=0.813950  Loss_Path=0.385597  Loss_Key=0.428353  PathIoU=0.2567  KeyIoU=0.1685  Score=0.2214
+2025-11-07 19:06:19,170 
+Epoch [38/200] --------------------------
+2025-11-07 19:07:21,679 Train Loss: Total=0.775870, Path=0.366537, Keypoint=0.409333
+2025-11-07 19:07:29,654 [Val] Loss_Total=0.811933  Loss_Path=0.383584  Loss_Key=0.428349  PathIoU=0.2548  KeyIoU=0.1675  Score=0.2199
+2025-11-07 19:07:29,655 
+Epoch [39/200] --------------------------
+2025-11-07 19:08:31,849 Train Loss: Total=0.773077, Path=0.365145, Keypoint=0.407932
+2025-11-07 19:08:39,879 [Val] Loss_Total=0.804280  Loss_Path=0.379522  Loss_Key=0.424758  PathIoU=0.2564  KeyIoU=0.1684  Score=0.2212
+2025-11-07 19:08:39,880 
+Epoch [40/200] --------------------------
+2025-11-07 19:09:42,318 Train Loss: Total=0.769934, Path=0.363596, Keypoint=0.406338
+2025-11-07 19:09:50,275 [Val] Loss_Total=0.808451  Loss_Path=0.381329  Loss_Key=0.427122  PathIoU=0.2569  KeyIoU=0.1683  Score=0.2214
+2025-11-07 19:09:50,275 
+Epoch [41/200] --------------------------
+2025-11-07 19:10:52,241 Train Loss: Total=0.778141, Path=0.367797, Keypoint=0.410344
+2025-11-07 19:11:00,169 [Val] Loss_Total=0.799984  Loss_Path=0.377671  Loss_Key=0.422312  PathIoU=0.2570  KeyIoU=0.1675  Score=0.2212
+2025-11-07 19:11:00,170 
+Epoch [42/200] --------------------------
+2025-11-07 19:12:02,597 Train Loss: Total=0.776441, Path=0.366886, Keypoint=0.409555
+2025-11-07 19:12:10,438 [Val] Loss_Total=0.823950  Loss_Path=0.390534  Loss_Key=0.433416  PathIoU=0.2554  KeyIoU=0.1672  Score=0.2202
+2025-11-07 19:12:10,438 
+Epoch [43/200] --------------------------
+2025-11-07 19:13:12,822 Train Loss: Total=0.773084, Path=0.365390, Keypoint=0.407694
+2025-11-07 19:13:20,720 [Val] Loss_Total=0.798650  Loss_Path=0.378307  Loss_Key=0.420343  PathIoU=0.2564  KeyIoU=0.1683  Score=0.2212
+2025-11-07 19:13:20,721 
+Epoch [44/200] --------------------------
+2025-11-07 19:14:23,395 Train Loss: Total=0.768543, Path=0.362617, Keypoint=0.405926
+2025-11-07 19:14:31,292 [Val] Loss_Total=0.787252  Loss_Path=0.371448  Loss_Key=0.415804  PathIoU=0.2568  KeyIoU=0.1687  Score=0.2216
+2025-11-07 19:14:31,292 
+Epoch [45/200] --------------------------
+2025-11-07 19:15:33,346 Train Loss: Total=0.779611, Path=0.368574, Keypoint=0.411037
+2025-11-07 19:15:41,351 [Val] Loss_Total=0.808550  Loss_Path=0.382373  Loss_Key=0.426177  PathIoU=0.2550  KeyIoU=0.1672  Score=0.2199
+2025-11-07 19:15:41,352 
+Epoch [46/200] --------------------------
+2025-11-07 19:16:43,646 Train Loss: Total=0.764953, Path=0.361048, Keypoint=0.403906
+2025-11-07 19:16:51,539 [Val] Loss_Total=0.805482  Loss_Path=0.380980  Loss_Key=0.424502  PathIoU=0.2581  KeyIoU=0.1689  Score=0.2224
+2025-11-07 19:16:51,540 
+Epoch [47/200] --------------------------
+2025-11-07 19:17:53,718 Train Loss: Total=0.770653, Path=0.364020, Keypoint=0.406633
+2025-11-07 19:18:01,540 [Val] Loss_Total=0.795459  Loss_Path=0.374961  Loss_Key=0.420498  PathIoU=0.2572  KeyIoU=0.1683  Score=0.2216
+2025-11-07 19:18:01,540 
+Epoch [48/200] --------------------------
+2025-11-07 19:19:03,446 Train Loss: Total=0.764362, Path=0.360592, Keypoint=0.403770
+2025-11-07 19:19:11,359 [Val] Loss_Total=0.816033  Loss_Path=0.384673  Loss_Key=0.431359  PathIoU=0.2541  KeyIoU=0.1648  Score=0.2184
+2025-11-07 19:19:11,360 
+Epoch [49/200] --------------------------
+2025-11-07 19:20:12,902 Train Loss: Total=0.769523, Path=0.363466, Keypoint=0.406057
+2025-11-07 19:20:20,802 [Val] Loss_Total=0.794769  Loss_Path=0.374962  Loss_Key=0.419807  PathIoU=0.2563  KeyIoU=0.1686  Score=0.2212
+2025-11-07 19:20:20,802 
+Epoch [50/200] --------------------------
+2025-11-07 19:21:23,126 Train Loss: Total=0.762550, Path=0.359780, Keypoint=0.402770
+2025-11-07 19:21:31,010 [Val] Loss_Total=0.787077  Loss_Path=0.370663  Loss_Key=0.416414  PathIoU=0.2567  KeyIoU=0.1681  Score=0.2213
+2025-11-07 19:21:31,011 
+Epoch [51/200] --------------------------
+2025-11-07 19:22:33,067 Train Loss: Total=0.761798, Path=0.359528, Keypoint=0.402270
+2025-11-07 19:22:40,910 [Val] Loss_Total=0.798028  Loss_Path=0.376685  Loss_Key=0.421343  PathIoU=0.2581  KeyIoU=0.1694  Score=0.2226
+2025-11-07 19:22:40,911 
+Epoch [52/200] --------------------------
+2025-11-07 19:23:42,922 Train Loss: Total=0.773492, Path=0.365518, Keypoint=0.407975
+2025-11-07 19:23:50,771 [Val] Loss_Total=0.794777  Loss_Path=0.375285  Loss_Key=0.419492  PathIoU=0.2563  KeyIoU=0.1685  Score=0.2212
+2025-11-07 19:23:50,771 
+Epoch [53/200] --------------------------
+2025-11-07 19:24:53,140 Train Loss: Total=0.764019, Path=0.360929, Keypoint=0.403090
+2025-11-07 19:25:00,981 [Val] Loss_Total=0.805946  Loss_Path=0.380507  Loss_Key=0.425439  PathIoU=0.2562  KeyIoU=0.1686  Score=0.2211
+2025-11-07 19:25:00,982 
+Epoch [54/200] --------------------------
+2025-11-07 19:26:03,042 Train Loss: Total=0.763047, Path=0.360383, Keypoint=0.402664
+2025-11-07 19:26:10,960 [Val] Loss_Total=0.800243  Loss_Path=0.378269  Loss_Key=0.421973  PathIoU=0.2555  KeyIoU=0.1668  Score=0.2200
+2025-11-07 19:26:10,960 
+Epoch [55/200] --------------------------
