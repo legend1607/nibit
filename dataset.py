@@ -4,7 +4,21 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from typing import Union
 
+def collate_fn_with_meta(batch):
+    """
+    batch: list of (env_voxel, joint_states, labels, meta)
+    只对前三个做默认拼接，meta 保持成 list，不去 stack 里面的 path 等可变长内容
+    """
+    env_voxels, joint_states, labels, metas = zip(*batch)  # 解包
+
+    env_voxels = torch.stack(env_voxels, dim=0)   # (B, 1, D, H, W)
+    joint_states = torch.stack(joint_states, dim=0)  # (B, N, DoF)
+    labels = torch.stack(labels, dim=0)           # (B, N)
+
+    # metas 直接作为 tuple/list 返回，不做进一步拼接
+    return env_voxels, joint_states, labels, list(metas)
 
 class ArmPointCloudDataset(Dataset):
     """
@@ -14,13 +28,6 @@ class ArmPointCloudDataset(Dataset):
         - voxel_grids: (M, D, H, W)
         - pc:          (M, N, DoF)
         - labels:      (M, N)
-    其他字段（可选）：
-        - starts:      (M, DoF)
-        - goals:       (M, DoF)
-        - env_ranges:  (M, 3, 2)
-        - pose_ranges: (M, DoF, 2)
-        - paths:       object 数组，每个元素是 (L_i, DoF)
-        - obstacles:   object 数组，列表，每个元素为 [(type, size, pos), ...]
     """
 
     def __init__(
@@ -28,7 +35,7 @@ class ArmPointCloudDataset(Dataset):
         npz_path: str,
         max_points: int = None,
         shuffle_points: bool = False,
-        device: torch.device | str | None = None,
+        device: Union[torch.device, str, None] = None,  # 修复这里
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -47,8 +54,8 @@ class ArmPointCloudDataset(Dataset):
         self.voxel_grids = data["voxel_grids"]      # (M, D, H, W)
         self.pc = data["pc"]                        # (M, N, DoF)
         self.labels = data["labels"]                # (M, N)
-
-        # 可选字段：使用 get 的方式，缺了也不报错
+        print("self.pc,",self.pc.shape)
+        # optional fields
         self.starts = data["starts"] if "starts" in data.files else None
         self.goals = data["goals"] if "goals" in data.files else None
         self.env_ranges = data["env_ranges"] if "env_ranges" in data.files else None
@@ -58,7 +65,6 @@ class ArmPointCloudDataset(Dataset):
 
         self.num_envs, self.num_points, self.dof = self.pc.shape
 
-        # 如果指定了 max_points，检查一下合理性（只支持 截断/下采样，不自动填充）
         if self.max_points is not None and self.max_points > self.num_points:
             raise ValueError(
                 f"max_points={self.max_points} > N={self.num_points}，"
@@ -69,17 +75,10 @@ class ArmPointCloudDataset(Dataset):
         return self.num_envs
 
     def _maybe_sample_points(self, pc_i, labels_i):
-        """
-        根据 max_points 对点云进行随机子采样。
-        pc_i:     (N, DoF)
-        labels_i: (N,)
-        """
         N = pc_i.shape[0]
         if self.max_points is None or self.max_points >= N:
-            # 不裁剪
             idx = np.arange(N)
         else:
-            # 随机下采样 max_points 个点
             idx = np.random.choice(N, self.max_points, replace=False)
 
         if self.shuffle_points:
@@ -88,51 +87,30 @@ class ArmPointCloudDataset(Dataset):
         return pc_i[idx], labels_i[idx]
 
     def __getitem__(self, idx):
-        """
-        返回：
-            env_voxel:   (1, D, H, W)  float32
-            joint_states:(N, DoF)     float32
-            labels:      (N,)         long
-            以及附加信息（字典形式），便于调试或可视化
-        """
-        voxel = self.voxel_grids[idx]     # (D, H, W)
-        pc_i = self.pc[idx]               # (N, DoF)
-        labels_i = self.labels[idx]       # (N,)
+        voxel = self.voxel_grids[idx]
+        pc_i = self.pc[idx]
+        labels_i = self.labels[idx]
 
-        # 可选：随机子采样/打乱点
         pc_i, labels_i = self._maybe_sample_points(pc_i, labels_i)
 
-        # 转 tensor
-        env_voxel = torch.from_numpy(voxel).unsqueeze(0)  # (1, D, H, W)
-        joint_states = torch.from_numpy(pc_i)
-        labels_t = torch.from_numpy(labels_i)
+        # 必须 clone()，必须是 CPU
+        env_voxel = torch.from_numpy(voxel).clone().unsqueeze(0).to(self.dtype)
+        joint_states = torch.from_numpy(pc_i).clone().to(self.dtype)
+        labels_t = torch.from_numpy(labels_i).clone().long()
 
-        env_voxel = env_voxel.to(self.dtype)
-        joint_states = joint_states.to(self.dtype)
-        labels_t = labels_t.long()
-
-        if self.device is not None:
-            env_voxel = env_voxel.to(self.device, non_blocking=True)
-            joint_states = joint_states.to(self.device, non_blocking=True)
-            labels_t = labels_t.to(self.device, non_blocking=True)
-
-        # 附加信息（不一定都存在）
+        # meta 保持 CPU + 不要在 DataLoader 里堆叠
         meta = {}
         if self.starts is not None:
-            meta["start"] = torch.from_numpy(self.starts[idx]).to(self.dtype)
+            meta["start"] = torch.from_numpy(self.starts[idx]).clone().to(self.dtype)
         if self.goals is not None:
-            meta["goal"] = torch.from_numpy(self.goals[idx]).to(self.dtype)
+            meta["goal"] = torch.from_numpy(self.goals[idx]).clone().to(self.dtype)
         if self.env_ranges is not None:
-            meta["env_range"] = torch.from_numpy(self.env_ranges[idx]).to(self.dtype)
+            meta["env_range"] = torch.from_numpy(self.env_ranges[idx]).clone().to(self.dtype)
         if self.pose_ranges is not None:
-            meta["pose_range"] = torch.from_numpy(self.pose_ranges[idx]).to(self.dtype)
+            meta["pose_range"] = torch.from_numpy(self.pose_ranges[idx]).clone().to(self.dtype)
         if self.paths is not None:
-            # paths[idx] 是一个 (L_i, DoF) 的 numpy 数组
-            path_arr = self.paths[idx]
-            meta["path"] = torch.from_numpy(path_arr).to(self.dtype)
+            meta["path"] = torch.from_numpy(self.paths[idx]).clone().to(self.dtype)
         if self.obstacles is not None:
-            # 障碍保持为 Python list，通常用于可视化
-            meta["obstacles"] = self.obstacles[idx]
+            meta["obstacles"] = self.obstacles[idx]  # 不转 tensor，保持原样
 
-        # 统一返回格式：env_voxel, joint_states, labels, meta
         return env_voxel, joint_states, labels_t, meta
