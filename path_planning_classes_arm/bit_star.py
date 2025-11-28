@@ -26,8 +26,9 @@ class BITStar:
                 goal,
                 environment, 
                 iter_max, 
+                batch_size,
                 pc_n_points, 
-                plot_flag=False, sampling=None, timer=None):
+                plot_flag=False, timer=None):
         if timer is None:
             self.timer = Timer()
         else:
@@ -36,7 +37,6 @@ class BITStar:
         self.env = environment
 
         # ---------- 关键：统一将 start/goal 转为可哈希 key ----------
-        # 使用 tuple 且对浮点做适度舍入以避免微小差异导致 key 不匹配
         self.start = self.to_key(start)
         self.goal = self.to_key(goal)
 
@@ -57,14 +57,14 @@ class BITStar:
 
         self.r = INF
         self.iter_max = iter_max
-        self.batch_size = pc_n_points
+        self.batch_size = batch_size
+        self.pc_n_points = pc_n_points
         self.T = 0
         self.eta = 1.1  # tunable parameter
         self.obj_radius = 1
         self.resolution = 3
 
         # the parameters for informed sampling
-        # NOTE: distance expects array-like inputs so to compute c_min use original numeric arrays
         self.c_min = self.distance(self.start, self.goal)
         self.center_point = None
         self.C = None
@@ -72,32 +72,29 @@ class BITStar:
         # whether plot the middle planning process
         self.plot_planning_process = plot_flag
 
-        if sampling is None:
-            self.sampling = self.sample_from_env
-        else:
-            self.sampling = sampling
-
         self.n_collision_points = 0
         self.n_free_points = 2
+        self.path = []
 
     # ---------- helper: convert any point-like to hashable tuple ----------
     def to_key(self, point, ndigits=6):
         """
-        将点转为 tuple(key)。若输入为 numpy array/list，先转换为 ndarray，再round到 ndigits。
-        返回 tuple(float,...)
+        将点转为 tuple(key)。
         """
+        if point is None:
+            raise ValueError("Cannot convert None to key")
+
         if isinstance(point, tuple):
             return tuple([float(round(x, ndigits)) for x in point])
         if isinstance(point, np.ndarray):
             arr = np.round(point.astype(float), ndigits)
             return tuple(arr.tolist())
-        # try castable list-like
         try:
             arr = np.round(np.array(point, dtype=float), ndigits)
             return tuple(arr.tolist())
-        except Exception:
-            # fallback: return as-is cast to tuple
-            return tuple(point)
+        except Exception as e:
+            raise ValueError(f"Cannot convert {type(point)} to key: {e}")
+
 
     # ---------------- planning setup ----------------
     def setup_planning(self):
@@ -138,7 +135,6 @@ class BITStar:
         """
         try:
             if not np.isfinite(self.c_min) or self.c_min <= 1e-12:
-                # disable informed sampling (will fallback to uniform)
                 self.center_point = None
                 self.C = None
                 return
@@ -166,16 +162,16 @@ class BITStar:
         self.C = Q
 
     def sample_unit_ball(self):
-        u = np.random.normal(0, 1, self.dimension)  # an array of d normally distributed random variables
+        u = np.random.normal(0, 1, self.dimension)
         norm = np.sum(u ** 2) ** (0.5)
         r = np.random.random() ** (1.0 / self.dimension)
         x = r * u / norm
         return x
 
-    def sample_from_env(self, c_best, sample_num, vertices=None):
+    def sample_from_env(self, c_best, batch_size, vertices=None):
         """
-        从椭圆域中进行 informed 采样。返回 list of tuple keys。
-        若 c_best 无效，则回退为在环境中均匀采样（调用 env.sample_empty_points）。
+        从椭圆域中进行 informed 采样。
+        如果采样失败次数过多，抛出异常让上层处理。
         """
         samples = []
 
@@ -188,39 +184,77 @@ class BITStar:
             or self.center_point is None
             or self.C is None
         ):
-            for _ in range(sample_num):
-                p = self.env.sample_empty_points()  # 返回 ndarray
-                samples.append(self.to_key(p))
+            consecutive_failures = 0
+            max_consecutive_failures = 50  # 连续失败50次就放弃
+
+            for _ in range(batch_size * 10):
+                try:
+                    p = self.env.sample_empty_points()
+                    if p is not None:
+                        samples.append(self.to_key(p))
+                        consecutive_failures = 0  # 重置失败计数
+                    else:
+                        consecutive_failures += 1
+                except Exception:
+                    consecutive_failures += 1
+
+                # ✅ 如果连续失败太多次，说明环境有问题
+                if consecutive_failures >= max_consecutive_failures:
+                    raise RuntimeError(
+                        f"Failed to sample {batch_size} points. "
+                        f"Environment may be too crowded. "
+                        f"Only sampled {len(samples)} points."
+                    )
+
+                if len(samples) >= batch_size:
+                    break
+
             return samples
 
-        # --- 椭圆参数 ---
+        # --- 椭圆采样 ---
         a = c_best / 2.0
         b = math.sqrt(max(0.0, c_best**2 - self.c_min**2)) / 2.0
         L = np.diag([a] + [b] * (self.dimension - 1))
 
-        # --- 椭圆采样 ---
-        # 注意：在高维下，椭圆采样可能效率较低
-        while len(samples) < sample_num:
-            x_ball = self.sample_unit_ball()  # 单位球采样
-            # 从椭圆采样空间变换回真实坐标（numpy array）
+        consecutive_failures = 0
+        max_consecutive_failures = 50
+
+        for _ in range(batch_size * 10):
+            x_ball = self.sample_unit_ball()
             x_ellipsoid = self.C @ (L @ x_ball) + self.center_point
 
-            # 检查碰撞（传递完整维度到 env._point_in_free_space）
             try:
                 if self.env._point_in_free_space(x_ellipsoid):
                     samples.append(self.to_key(x_ellipsoid))
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
             except Exception:
-                # 如果 env 的检测只支持 discrete/2D 等，回退成 uniform 采样
-                p = self.env.sample_empty_points()
-                samples.append(self.to_key(p))
+                # 回退尝试
+                try:
+                    p = self.env.sample_empty_points()
+                    if p is not None:
+                        samples.append(self.to_key(p))
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                except Exception:
+                    consecutive_failures += 1
+
+            if consecutive_failures >= max_consecutive_failures:
+                raise RuntimeError(
+                    f"Failed to sample from ellipsoid. "
+                    f"Environment may be too crowded. "
+                    f"Only sampled {len(samples)} points."
+                )
+
+            if len(samples) >= batch_size:
+                break
 
         return samples
 
-    def get_random_point(self):
-        return self.to_key(self.env.sample_empty_points())
 
     def is_point_free(self, point):
-        # point: tuple or array-like -> pass numeric array to env
         numeric = np.array(point, dtype=float)
         result = self.env._state_fp(numeric)
         if result:
@@ -236,14 +270,15 @@ class BITStar:
         return result
 
     def get_g_score(self, point):
-        # point expected to be tuple key
         if point == self.start:
             return 0
         return self.g_scores.get(point, INF)
 
     def get_f_score(self, point):
-        # f^(x) = g(start->x) + h(x->goal)
-        return self.heuristic_cost(self.start, point) + self.heuristic_cost(point, self.goal)
+        g = self.get_g_score(point)
+        if g == INF:
+            g = self.heuristic_cost(self.start, point)
+        return g + self.heuristic_cost(point, self.goal)
 
     def actual_edge_cost(self, point1, point2):
         if not self.is_edge_free([point1, point2]):
@@ -254,11 +289,9 @@ class BITStar:
         return self.distance(point1, point2)
     
     def distance(self, point1, point2):
-        # accepts tuple or array-like
         return np.linalg.norm(np.array(point1, dtype=float) - np.array(point2, dtype=float))
 
     def get_edge_value(self, edge):
-        # edge: (p1_tuple, p2_tuple)
         return self.get_g_score(edge[0]) + self.heuristic_cost(edge[0], edge[1]) + self.heuristic_cost(edge[1], self.goal)
 
     def get_point_value(self, point):
@@ -276,22 +309,79 @@ class BITStar:
         else:
             return self.edge_queue[0][0]
 
+    def get_current_path_points(self):
+        """获取当前最优路径上的所有点（用于保护路径不被修剪）"""
+        path_points = set()
+        if self.get_g_score(self.goal) == INF:
+            return path_points
+        
+        point = self.goal
+        path_points.add(point)
+        
+        # 安全地回溯路径
+        visited = set()
+        max_iterations = len(self.vertices) + 100
+        iteration = 0
+        
+        while point != self.start and iteration < max_iterations:
+            if point in visited:  # 检测循环
+                break
+            if point not in self.edges:  # 路径断裂
+                break
+            
+            visited.add(point)
+            point = self.to_key(self.edges[point])
+            path_points.add(point)
+            iteration += 1
+        
+        return path_points
+
     def prune_edge(self, c_best):
+        """修剪边，但保护当前最优路径"""
+        # 获取当前路径上的点（需要保护）
+        path_points = self.get_current_path_points()
+        
         edge_array = list(self.edges.items())
         for point, parent in edge_array:
+            point = self.to_key(point)
+            parent = self.to_key(parent)
+            
+            # 关键：不要删除当前最优路径上的边
+            if point in path_points:
+                continue
+            
+            # 删除超出椭圆域的边
             if self.get_f_score(point) > c_best or self.get_f_score(parent) > c_best:
                 self.edges.pop(point, None)
 
     def prune(self, c_best):
+        """修剪顶点和边，但保护当前最优路径"""
+        # 先保护当前路径
+        path_points = self.get_current_path_points()
+        
+        # 修剪样本点
         self.samples = [point for point in self.samples if self.get_f_score(point) < c_best]
+        
+        # 修剪边（保护当前路径）
         self.prune_edge(c_best)
+        
+        # 修剪顶点
         vertices_temp = []
         for point in self.vertices:
-            if self.get_f_score(point) <= c_best:
+            point = self.to_key(point)
+            f = self.get_f_score(point)
+            
+            # 保护当前路径上的点
+            if point in path_points:
+                vertices_temp.append(point)
+                continue
+            
+            if f <= c_best:
                 if self.get_g_score(point) == INF:
                     self.samples.append(point)
                 else:
                     vertices_temp.append(point)
+        
         self.vertices = vertices_temp
 
     def expand_vertex(self, point):
@@ -304,7 +394,7 @@ class BITStar:
         self.timer.start()
         # push potential edges (point->neighbor) into edge_queue
         for neighbor in neigbors_sample:
-            estimated_f_score = self.heuristic_cost(self.start, point) + \
+            estimated_f_score = self.get_g_score(point) + \
                                 self.heuristic_cost(point, neighbor) + self.heuristic_cost(neighbor, self.goal)
             if estimated_f_score < self.get_g_score(self.goal):
                 heapq.heappush(self.edge_queue, (self.get_edge_value((point, neighbor)), (point, neighbor)))
@@ -314,7 +404,7 @@ class BITStar:
             neigbors_vertex = [ver for ver in self.vertices if self.distance(point, ver) <= self.r]
             for neighbor in neigbors_vertex:
                 if neighbor not in self.edges or point != self.edges.get(neighbor):
-                    estimated_f_score = self.heuristic_cost(self.start, point) + \
+                    estimated_f_score = self.get_g_score(point) + \
                                         self.heuristic_cost(point, neighbor) + self.heuristic_cost(neighbor, self.goal)
                     if estimated_f_score < self.get_g_score(self.goal):
                         estimated_g_score = self.get_g_score(point) + self.heuristic_cost(point, neighbor)
@@ -324,14 +414,43 @@ class BITStar:
         self.timer.finish(Timer.EXPAND)
 
     def get_best_path(self):
+        """获取最优路径，带有完整的错误检查"""
         path = []
-        if self.g_scores[self.goal] != INF:
-            path.append(self.goal)
-            point = self.goal
-            while point != self.start:
-                point = self.edges[point]
-                path.append(point)
-            path.reverse()
+        if self.get_g_score(self.goal) == INF:
+            return path
+        
+        path.append(self.goal)
+        point = self.goal
+        visited = set()  # 防止无限循环
+        max_iterations = len(self.vertices) + 100
+        iteration = 0
+        
+        while point != self.start and iteration < max_iterations:
+            # 添加循环检测
+            if point in visited:
+                print(f"Warning: Cycle detected at {point}")
+                return []
+            visited.add(point)
+            
+            # 检查父节点是否存在
+            if point not in self.edges:
+                print(f"Warning: Point {point} has no parent in edges")
+                print(f"Current point g_score: {self.g_scores.get(point, 'N/A')}")
+                print(f"Is point in vertices: {point in self.vertices}")
+                print(f"Total edges: {len(self.edges)}, Total vertices: {len(self.vertices)}")
+                return []  # 返回空路径而不是崩溃
+            
+            parent = self.edges[point]
+            parent = self.to_key(parent)  # 确保 key 一致性
+            path.append(parent)
+            point = parent
+            iteration += 1
+        
+        if iteration >= max_iterations:
+            print(f"Warning: Path too long ({iteration}), possible error")
+            return []
+        
+        path.reverse()
         return path
 
     def path_length_calculate(self, path):
@@ -341,26 +460,31 @@ class BITStar:
         return path_length
 
     def planning(self, visualize=False, refresh_interval=1):
+        no_improve_limit = 50
+        no_improve_count = 0
+        best_cost = self.get_g_score(self.goal)
+
         collision_checks = self.env.collision_check_count
         self.setup_planning()
 
         init_time = time()
+        iteration_costs = []
 
         for k in range(self.iter_max):
+            final_iter = k
+
             # 1. 如果队列为空 -> 新采样
             if not self.vertex_queue and not self.edge_queue:
                 c_best = self.get_g_score(self.goal)
                 self.prune(c_best)
-                if math.isinf(c_best):
-                    new_samples = [self.get_random_point() for _ in range(self.batch_size)]
-                else:
-                    new_samples = self.sampling(c_best, self.batch_size, self.vertices)
+                new_samples = self.sample_from_env(c_best, self.batch_size, self.vertices)
+                new_samples = [self.to_key(p) for p in new_samples]
                 self.samples.extend(new_samples)
                 self.T += self.batch_size
 
                 self.timer.start()
-                self.old_vertices = set(self.vertices)
-                self.vertex_queue = [(self.get_point_value(point), point) for point in self.vertices]
+                self.old_vertices = set([self.to_key(v) for v in self.vertices])
+                self.vertex_queue = [(self.get_point_value(v), self.to_key(v)) for v in self.vertices]
                 heapq.heapify(self.vertex_queue)
                 q = len(self.vertices) + len(self.samples)
                 if q > 0:
@@ -372,6 +496,7 @@ class BITStar:
                 while self.bestVertexQueueValue() <= self.bestEdgeQueueValue():
                     self.timer.start()
                     _, point = heapq.heappop(self.vertex_queue)
+                    point = self.to_key(point)
                     self.timer.finish(Timer.HEAP)
                     self.expand_vertex(point)
             except Exception as e:
@@ -385,53 +510,92 @@ class BITStar:
                 continue
 
             best_edge_value, bestEdge = heapq.heappop(self.edge_queue)
+            bestEdge = (self.to_key(bestEdge[0]), self.to_key(bestEdge[1]))
+
             if best_edge_value < self.get_g_score(self.goal):
                 actual_cost_of_edge = self.actual_edge_cost(bestEdge[0], bestEdge[1])
                 self.timer.start()
                 actual_f_edge = (
-                    self.heuristic_cost(self.start, bestEdge[0]) +
+                    self.get_g_score(bestEdge[0]) +
                     actual_cost_of_edge +
                     self.heuristic_cost(bestEdge[1], self.goal)
                 )
                 if actual_f_edge < self.get_g_score(self.goal):
                     actual_g_score_of_point = self.get_g_score(bestEdge[0]) + actual_cost_of_edge
                     if actual_g_score_of_point < self.get_g_score(bestEdge[1]):
-                        # update g_score and parent (edges) using tuple keys
-                        self.g_scores[bestEdge[1]] = actual_g_score_of_point
-                        self.edges[bestEdge[1]] = bestEdge[0]
-                        if bestEdge[1] not in self.vertices:
+                        # 确保所有 key 都经过 to_key 处理
+                        point_key = self.to_key(bestEdge[1])
+                        parent_key = self.to_key(bestEdge[0])
+                        
+                        self.g_scores[point_key] = actual_g_score_of_point
+                        self.edges[point_key] = parent_key
+
+                        if point_key not in self.vertices:
                             try:
-                                self.samples.remove(bestEdge[1])
+                                self.samples.remove(point_key)
                             except ValueError:
                                 pass
-                            self.vertices.append(bestEdge[1])
-                            heapq.heappush(self.vertex_queue, (self.get_point_value(bestEdge[1]), bestEdge[1]))
+                            self.vertices.append(point_key)
+                            heapq.heappush(self.vertex_queue, (self.get_point_value(point_key), point_key))
 
-                        # prune inconsistent edges pointing to bestEdge[1]
+                        # prune inconsistent edges
                         self.edge_queue = [
                             item for item in self.edge_queue
-                            if item[1][1] != bestEdge[1] or
-                            self.get_g_score(item[1][0]) + self.heuristic_cost(item[1][0], item[1][1]) <
-                            self.get_g_score(item[1][0])
+                            if self.to_key(item[1][1]) != point_key or
+                            self.get_g_score(self.to_key(item[1][0])) + self.heuristic_cost(
+                                self.to_key(item[1][0]), self.to_key(item[1][1])
+                            ) < self.get_g_score(self.to_key(item[1][1]))
                         ]
                         heapq.heapify(self.edge_queue)
                 self.timer.finish(Timer.HEAP)
             else:
                 self.vertex_queue = []
                 self.edge_queue = []
-            
+
+            # 4. Update path
             self.path = self.get_best_path()
-        # print(f"[BIT*] Iteration {k}/{self.iter_max}, Best path length: {self.path_length_calculate(self.path) if self.path else 'INF'}")
+            iteration_costs.append(self.get_g_score(self.goal))
 
-            # 4. 实时可视化
+            current_cost = self.get_g_score(self.goal)
 
-        return (self.path,
+            if current_cost < best_cost:
+                best_cost = current_cost
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= no_improve_limit:
+                break
+
+            # 判定 1：找到直接连接的最优路径
+            if len(self.path) == 2 and self.path[0] == self.start and self.path[1] == self.goal:
+                break
+
+            # 判定 2：环境允许直接连线，并且路径长度接近直线距离
+            direct_free = False
+            try:
+                direct_free = self.is_edge_free([self.start, self.goal])
+            except Exception:
+                direct_free = False
+
+            if direct_free:
+                current_len = self.path_length_calculate(self.path) if len(self.path) > 1 else INF
+                straight_len = self.distance(self.start, self.goal)
+                if abs(current_len - straight_len) <= 1e-8:
+                    break
+
+        return (
+            self.path,
             self.samples,
             self.edges,
             self.env.collision_check_count - collision_checks,
             self.get_g_score(self.goal),
             self.T,
-            time() - init_time)
+            time() - init_time,
+            final_iter,
+            iteration_costs
+        )
+
 
 def get_bit_planner(
     args,
@@ -443,6 +607,7 @@ def get_bit_planner(
         problem["goal"],
         problem['env'],
         args.iter_max,
+        args.batch_size,
         args.pc_n_points,
     )
     return planner
