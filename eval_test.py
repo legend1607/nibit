@@ -12,7 +12,7 @@ from model.encoders.joint_pointlite_encoder import JointPointNetEncoder
 import torch.nn.functional as F
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import time  # ✅ 用于计时
+import time  # 用于计时
 
 
 # ================================================================
@@ -35,7 +35,7 @@ def parse_args():
         help='max points per sample to scatter in visualization'
     )
 
-    # ✅ 新增：eval 随机环境 & 随机关节
+    # eval 随机环境 & 随机关节
     parser.add_argument(
         '--eval_num_env',
         type=int,
@@ -54,18 +54,23 @@ def parse_args():
 
 # ================================================================
 # 单样本 benchmark：随机环境 + 随机关节
+# 每个 voxel 只算一次 env_feat，后面只跑 forward_with_env_feat
 # ================================================================
 def benchmark_single_sample(model, dataset, device, log_fn=print,
                             warmup=10, num_run=50, num_env=5, max_points=None):
     """
     随机选 num_env 个环境；每个环境再随机选 max_points 个关节角度点做 benchmark。
-    如果 max_points 为 None，则使用该环境里的所有点。
+    - CNN 只算一次 env_feat，单独计时
+    - MLP+PointNetLite 在同一个 env_feat 上跑 num_run 次，计平均时间
     """
     model.eval()
     import random
     indices = random.sample(range(len(dataset)), k=min(num_env, len(dataset)))
 
-    times = []
+    cnn_times = []
+    head_times = []
+    M_record = None
+
     for idx in indices:
         sample = dataset[idx]
         env_voxel, joint_states, labels, meta = sample   # joint_states: (N, dof)
@@ -82,32 +87,54 @@ def benchmark_single_sample(model, dataset, device, log_fn=print,
         env_voxel = env_voxel.unsqueeze(0).to(device)        # (1, 1, D, H, W)
         joint_states = joint_states.unsqueeze(0).to(device)  # (1, M, dof) M=子采样后点数
         B, M, _ = joint_states.shape  # B=1
+        M_record = M
 
-        # warmup
+        # warmup：用真实流程（encode_env + forward_with_env_feat）预热
         with torch.no_grad():
             for _ in range(warmup):
-                _ = model(env_voxel, joint_states)
+                env_feat = model.encode_env(env_voxel)
+                _ = model.forward_with_env_feat(env_feat, joint_states)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.time()
+        # 1）CNN 一次性算 env_feat
         with torch.no_grad():
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.time()
+            env_feat = model.encode_env(env_voxel)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.time()
+        cnn_dt = t1 - t0
+
+        # 2）在同一个 env_feat 上多次评估 joint_states，只计 head 部分
+        with torch.no_grad():
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.time()
             for _ in range(num_run):
-                _ = model(env_voxel, joint_states)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.time()
+                _ = model.forward_with_env_feat(env_feat, joint_states)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t3 = time.time()
+        head_dt = (t3 - t2) / num_run
 
-        times.append((t1 - t0) / num_run)
+        cnn_times.append(cnn_dt)
+        head_times.append(head_dt)
 
-    avg_time = sum(times) / len(times)
-    per_point = avg_time / (B * M)
+    avg_cnn = sum(cnn_times) / len(cnn_times)
+    avg_head = sum(head_times) / len(head_times)
 
-    log_fn("========== SINGLE SAMPLE BENCH (multi-env, random joints) ==========")
-    log_fn(f"Indices              : {indices}")
-    log_fn(f"Num points per env   : {M} (after random sampling)")
-    log_fn(f"Avg forward time     : {avg_time * 1000:.3f} ms / env")
-    log_fn(f"Avg per-point time   : {per_point * 1e6:.3f} us / point")
+    per_point_cnn = avg_cnn / (B * M_record)
+    per_point_head = avg_head / (B * M_record)
+
+    log_fn("========== SINGLE SAMPLE BENCH (multi-env, cached env_feat) ==========")
+    log_fn(f"Indices                : {indices}")
+    log_fn(f"Num points per env     : {M_record} (after random sampling)")
+    log_fn(f"Avg CNN time           : {avg_cnn * 1000:.3f} ms / env")
+    log_fn(f"Avg head time          : {avg_head * 1000:.3f} ms / env")
+    log_fn(f"Avg total (CNN+head)   : {(avg_cnn + avg_head) * 1000:.3f} ms / env")
+    log_fn(f"Avg CNN per-point      : {per_point_cnn * 1e6:.3f} us / point")
+    log_fn(f"Avg head per-point     : {per_point_head * 1e6:.3f} us / point")
     log_fn("=====================================================================")
 
 
@@ -169,7 +196,7 @@ def visualize_sample_2d_joint(
     labels = labels.detach().cpu().numpy().astype(np.int64)
     preds = preds.detach().cpu().numpy().astype(np.int64)
 
-    # ✅ 防止有 ignore_index（例如 -1）
+    # 防止有 ignore_index（例如 -1）
     valid = labels >= 0
     joint_states = joint_states[valid]
     labels = labels[valid]
@@ -235,7 +262,7 @@ def visualize_sample_2d_joint(
 
     plt.tight_layout()
 
-    # ✅ 文件名也带上 env_idx，方便回溯
+    # 文件名也带上 env_idx，方便回溯
     if env_idx is not None:
         out_name = f"sample_{sample_idx:04d}_env_{env_idx:04d}.png"
     else:
@@ -244,6 +271,7 @@ def visualize_sample_2d_joint(
     out_path = os.path.join(out_dir, out_name)
     plt.savefig(out_path)
     plt.close(fig)
+
 
 # ================================================================
 # main eval
@@ -287,7 +315,7 @@ def main(args):
         device=None,
     )
 
-    # ✅ 如果设置了 eval_num_env，则随机采样这么多 env 来做评估
+    # 如果设置了 eval_num_env，则随机采样这么多 env 来做评估
     if args.eval_num_env is not None:
         num_env = min(args.eval_num_env, len(test_dataset))
         sampler = RandomSampler(
@@ -316,20 +344,24 @@ def main(args):
         )
 
     # -------------------------
-    # Model
+    # Model  （⚠️ 要和训练时超参一致）
     # -------------------------
     joint_in_dim = test_dataset.dof
 
     model = JointPointNetEncoder(
         joint_in_dim=joint_in_dim,
-        joint_feat_dim=64,
-        env_latent_dim=60,
-        pointnet_embed_dim=256,
+        joint_feat_dim=48,          # 与 train.py 保持一致
+        env_latent_dim=60,          # train 时也是 60
+        pointnet_embed_dim=128,     # 轻量版
+        self_attn_layers=1,
         num_classes=3,
-        dropout_p=0,
+        self_attn_dropout=0.1,
+        point_mlp_dropout=0.1,
+        point_feat_dropout=0.1,
+        cls_dropout=0.1,
     ).to(device)
 
-    # ====== 打印模型结构和参数量 ======
+    # 打印模型结构和参数量
     log_string("========== MODEL STRUCTURE ==========")
     log_string(str(model))
 
@@ -337,8 +369,8 @@ def main(args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     log_string("========== MODEL PARAMETERS ==========")
-    log_string(f"Total params       : {total_params:,}")
-    log_string(f"Trainable params   : {trainable_params:,}")
+    log_string(f"Total params        : {total_params:,}")
+    log_string(f"Trainable params    : {trainable_params:,}")
     log_string(f"Non-trainable params: {total_params - trainable_params:,}")
     log_string("======================================")
 
@@ -347,10 +379,10 @@ def main(args):
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
     log_string("========== MODEL PARAMS BY MODULE ==========")
-    log_string(f"env_encoder params   : {count_parameters(model.env_encoder):,}")
-    log_string(f"joint_encoder params : {count_parameters(model.joint_encoder):,}")
-    log_string(f"pointnet params      : {count_parameters(model.pointnet):,}")
-    log_string(f"classifier mlp params: {count_parameters(model.mlp):,}")
+    log_string(f"env_encoder params    : {count_parameters(model.env_encoder):,}")
+    log_string(f"joint_encoder params  : {count_parameters(model.joint_encoder):,}")
+    log_string(f"pointnet params       : {count_parameters(model.pointnet):,}")
+    log_string(f"classifier mlp params : {count_parameters(model.mlp):,}")
     log_string("============================================")
 
     # Load checkpoint
@@ -361,7 +393,7 @@ def main(args):
     # -------------------------
     # 单个环境延迟 benchmark（随机环境 + 随机关节）
     # -------------------------
-    log_string("Running single-sample latency benchmark on random env & joints ...")
+    log_string("Running single-sample latency benchmark on random env & joints (cached env_feat) ...")
     benchmark_single_sample(
         model,
         test_dataset,
@@ -373,8 +405,8 @@ def main(args):
         max_points=2000   # 随机抽 2000 个关节角度
     )
 
-    # Loss (可选，如果想看 test loss)
-    class_weights = torch.tensor([1.5, 1.0, 3.0], device=device)
+    # Loss (可选，如果想看 test loss) —— 和 train.py 对齐
+    class_weights = torch.tensor([1.5, 1.0, 2.0], device=device)
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     # -------------------------
@@ -387,20 +419,18 @@ def main(args):
     total_loss = 0.0
     correct, total = 0, 0
 
-    # ⏱️ 推理时间统计
-    total_infer_time = 0.0     # 所有 batch 推理时间总和（秒）
-    total_infer_points = 0     # 所有 batch 内点的总数
-    total_samples = 0          # 所有样本数
-    num_batches = 0
+    # ⏱️ 推理时间统计（拆成 CNN 和 head）
+    total_cnn_time = 0.0      # 所有 batch CNN 时间总和（秒）
+    total_head_time = 0.0     # 所有 batch head 时间总和（秒）
+    total_points = 0          # 所有 batch 内点的总数
+    total_envs = 0            # env 数
 
     # 用于可视化的 sample 计数
     vis_count = 0
     global_sample_idx = 0  # 跨 batch 的 sample 索引
-    # ✅ 当前 DataLoader 中 env 的遍历顺序（对应 dataset 的 index）
     env_indices_order = list(test_loader.sampler)
 
-    # ✅ 随机选择要可视化的 env（按 env 的 dataset 索引来）
-    # 可视化的 env 数量不超过 args.num_vis
+    # 随机选择要可视化的 env（按 env 的 dataset 索引来）
     num_env_vis = min(args.num_vis, len(env_indices_order))
     vis_env_indices = set(
         np.random.choice(env_indices_order, size=num_env_vis, replace=False)
@@ -415,7 +445,7 @@ def main(args):
             joint_states = joint_states.to(device)  # (B,N,dof)
             labels = labels.to(device)              # (B,N)
 
-            # ✅ 在 eval 中对关节点做随机子采样（N 维）
+            # 在 eval 中对关节点做随机子采样（N 维）
             if args.max_points_eval is not None:
                 N_full = joint_states.shape[1]
                 if N_full > args.max_points_eval:
@@ -425,25 +455,30 @@ def main(args):
 
             B, N, _ = joint_states.shape
 
-            # -------------------------
-            # ⏱️ 计时：一次 batch 推理
-            # -------------------------
+            # 1）CNN：每个 env 只算一次 env_feat（按 batch 一起算）
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.time()
-
-            logits, _, _ = model(env_voxel, joint_states)
-
+            env_feat = model.encode_env(env_voxel)           # (B, F_env)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t1 = time.time()
+            cnn_dt = t1 - t0
 
-            dt = t1 - t0
-            total_infer_time += dt
-            total_infer_points += B * N
-            total_samples += B
-            num_batches += 1
-            # -------------------------
+            # 2）head：只用 env_feat + joint_states
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.time()
+            logits, _, _ = model.forward_with_env_feat(env_feat, joint_states)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t3 = time.time()
+            head_dt = t3 - t2
+
+            total_cnn_time += cnn_dt
+            total_head_time += head_dt
+            total_points += B * N
+            total_envs += B
 
             B, N, C = logits.shape
 
@@ -466,27 +501,21 @@ def main(args):
             bincount = torch.bincount(k, minlength=num_classes * num_classes)
             confmat += bincount.view(num_classes, num_classes)
 
-            # -------------------------
             # ✅ 可视化：随机 env，而不是前几个 env
-            # -------------------------
             for b in range(B):
-                # 这个样本在 dataset 中对应的 env index
                 if env_cursor + b < len(env_indices_order):
                     env_idx = env_indices_order[env_cursor + b]
                 else:
-                    env_idx = None  # 理论上不会发生，只是兜底
+                    env_idx = None
 
-                # 如果这个 env 不在我们随机抽出来的列表里，就跳过
                 if (env_idx is None) or (env_idx not in vis_env_indices):
                     global_sample_idx += 1
                     continue
 
-                # 如果已经达到可视化上限，也可以直接 break
                 if vis_count >= args.num_vis:
                     global_sample_idx += 1
                     continue
 
-                # 拿出第 b 个样本
                 js_b = joint_states[b]  # (N,dof)
                 lb_b = labels[b]        # (N,)
                 pr_b = preds[b]         # (N,)
@@ -501,12 +530,9 @@ def main(args):
 
                 vis_count += 1
                 global_sample_idx += 1
-                # 这个 env 已经画过了，从集合里移除，避免重复
                 vis_env_indices.remove(env_idx)
 
-            # ✅ 无论是否可视化，这个 batch 的 B 个 env 都已经“消费掉”
             env_cursor += B
-
 
     avg_test_loss = total_loss / len(test_loader)
     test_acc = correct / total if total > 0 else 0.0
@@ -563,21 +589,23 @@ def main(args):
     )
 
     # -------------------------
-    # ⏱️ 推理时间统计结果
+    # ⏱️ 推理时间统计结果（分 CNN / head）
     # -------------------------
-    if num_batches > 0 and total_samples > 0 and total_infer_points > 0:
-        avg_batch_time = total_infer_time / num_batches        # 秒 / batch
-        avg_sample_time = total_infer_time / total_samples     # 秒 / sample
-        avg_point_time = total_infer_time / total_infer_points # 秒 / point
+    if total_envs > 0 and total_points > 0:
+        avg_cnn_env = total_cnn_time / total_envs
+        avg_head_env = total_head_time / total_envs
+        avg_total_env = avg_cnn_env + avg_head_env
 
-        log_string("========== INFERENCE SPEED ==========")
-        log_string(f"Avg batch infer time  : {avg_batch_time * 1000:.3f} ms/batch")
-        log_string(f"Avg sample infer time : {avg_sample_time * 1000:.3f} ms/sample")
-        log_string(f"Avg point infer time  : {avg_point_time * 1e6:.3f} us/point")
-        # 如果典型是 2000 points，可以给一个直观估计
-        est_2000_time = avg_point_time * 2000
-        log_string(f"Estimated 2000-point sample: {est_2000_time * 1000:.3f} ms")
-        log_string("======================================")
+        avg_total_point = (total_cnn_time + total_head_time) / total_points
+
+        log_string("========== INFERENCE SPEED (split CNN/head) ==========")
+        log_string(f"Avg CNN time per env   : {avg_cnn_env * 1000:.3f} ms/env")
+        log_string(f"Avg head time per env  : {avg_head_env * 1000:.3f} ms/env")
+        log_string(f"Avg total time per env : {avg_total_env * 1000:.3f} ms/env")
+        log_string(f"Avg total per-point    : {avg_total_point * 1e6:.3f} us/point")
+        est_2000_time = avg_total_point * 2000
+        log_string(f"Estimated 2000-point sample (CNN+head): {est_2000_time * 1000:.3f} ms")
+        log_string("======================================================")
 
     log_string(f"2D joint-space visualizations saved to: {fig_dir}")
 

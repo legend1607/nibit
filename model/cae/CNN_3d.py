@@ -8,11 +8,16 @@ from torch.autograd import Variable
 import torch.nn as nn
 
 class Encoder_CNN_3D(nn.Module):
-    def __init__(self, dropout_p=0):
+    def __init__(self):
         super().__init__()
         self.conv_layers = nn.Sequential(
-            nn.Conv3d(1, 4, 3, 1, 1),
-            nn.BatchNorm3d(4), 
+            nn.Conv3d(1, 2, 3, 1, 1),
+            nn.BatchNorm3d(2), 
+            nn.ReLU(),
+            nn.MaxPool3d(2),
+
+            nn.Conv3d(2, 4, 3, 1, 1),
+            nn.BatchNorm3d(4),
             nn.ReLU(),
             nn.MaxPool3d(2),
 
@@ -30,20 +35,13 @@ class Encoder_CNN_3D(nn.Module):
             nn.BatchNorm3d(32),
             nn.ReLU(),
             nn.MaxPool3d(2),
-
-            nn.Conv3d(32, 64, 3, 1, 1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.MaxPool3d(2),
         )
 
-        # final shape = (B, 64, 1, 1, 1)
+        # final shape = (B, 32, 1, 1, 1)
         self.fc_layers = nn.Sequential(
-            nn.Linear(64 * 1 * 1 * 1, 512),
+            nn.Linear(32 * 1 * 1 * 1, 256),
             nn.ReLU(),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, 60)
+            nn.Linear(256, 60)
         )
 
     def forward(self, x):

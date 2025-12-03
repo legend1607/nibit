@@ -9,20 +9,20 @@ from environment.liche_env import LicheEnv   # ✅ 使用 LicheEnv 做采样和�
 ENV_TYPE = "liche"
 
 base_dir = "data"
-splits = ["train", "val", "test"]
+splits = ["train","val","test"]
 
 npoints = 2000                           # 每个样本最终采样的关节状态数量
 voxel_resolution = np.array([50, 50, 50], dtype=int)  # 体素分辨率 (X, Y, Z)
 
 # 路径邻近判定阈值（归一化后空间）
-PATH_DIST_THRESH = 0.05
+PATH_DIST_THRESH = 0.08
 
 # 过采样倍数
 OVERSAMPLE_FACTOR = 3   # 实际采 M = npoints * OVERSAMPLE_FACTOR
 
 # 加权抽样权重
-W_PATH = 2.0       
-W_COLL = 2.0       
+W_PATH = 1.0       
+W_COLL = 1.0       
 W_FREE = 1.0       
 
 # ============================
@@ -145,6 +145,11 @@ def process_split(split_name):
             elif typ == "sphere":
                 r = float(size[0])
                 env_sim.add_sphere_obstacle(r, pos)
+#         print("JSON pose_range low:", low)
+#         print("JSON pose_range high:", high)
+
+#         print("env_sim.pose_range low:", env_sim.pose_range[:, 0])
+#         print("env_sim.pose_range high:", env_sim.pose_range[:, 1])
 
         num_paths = len(paths)
         for i in range(num_paths):
@@ -155,23 +160,116 @@ def process_split(split_name):
             D = start_raw.shape[0]
             M = npoints * OVERSAMPLE_FACTOR
 
-            # -------- 采样 --------
+            # -------- 采样（路径附近 + 全局均匀，数量由路径长度+点数决定）--------
             states_raw_big = []
-            M_path = int(M * 0.3)
-            M_uniform = M - M_path
 
+            # 归一化 path，用于计算长度
+            path_norm = (path_raw - low) / span
+            T = len(path_norm)
+
+            # 计算整条路径在归一化空间里的总长度
+            if T > 1:
+                seg_vecs = path_norm[1:] - path_norm[:-1]       # (T-1, D)
+                seg_lens = np.linalg.norm(seg_vecs, axis=1)     # (T-1,)
+                total_len = float(np.sum(seg_lens))
+            else:
+                seg_vecs = None
+                seg_lens = None
+                total_len = 0.0
+
+            # === 核心：根据路径长度 + 点数决定 near-path 采样数 ===
+            # 可以调这两个超参数
+            SAMPLES_PER_UNIT_LEN   = 800   # 每单位归一化路径长度分配多少 near-path 点
+            SAMPLES_PER_WAYPOINT   = 5     # 每个路径点额外分配多少 near-path 点
+
+            M_path_raw = SAMPLES_PER_UNIT_LEN * total_len + SAMPLES_PER_WAYPOINT * T
+            # 裁剪到 [0, M]，保证不会超过总采样量
+            M_path_eff = int(np.clip(M_path_raw, 0, M))
+            M_uniform  = M - M_path_eff
+
+            # 1) 全局均匀采样
             for _ in range(M_uniform):
                 states_raw_big.append(env_sim.uniform_sample())
-            for _ in range(M_path):
-                idx = np.random.randint(0, len(path_raw))
-                base = path_raw[idx]
-                noise = np.random.uniform(-PATH_DIST_THRESH*0.8,
-                                           PATH_DIST_THRESH*0.8,
-                                           size=base.shape)
-                q = np.clip(base + noise, low, high)
-                states_raw_big.append(q)
 
+            # 2) 按“线段长度”采样路径附近（总共 M_path_eff 个点）
+            if M_path_eff > 0:
+                if T < 2:
+                    # 只有一个路径点：围绕这个点打 M_path_eff 个“球”
+                    center = path_norm[0]
+                    for _ in range(M_path_eff):
+                        dir_noise = np.random.normal(size=D).astype(np.float32)
+                        norm = np.linalg.norm(dir_noise) + 1e-9
+                        dir_noise = dir_noise / norm
+
+                        r = PATH_DIST_THRESH * np.random.rand()  # [0, PATH_DIST_THRESH]
+                        noise_norm = dir_noise * r
+
+                        q_norm = center + noise_norm
+                        q_norm = np.clip(q_norm, 0.0, 1.0)
+
+                        q = low + q_norm * span
+                        q = np.clip(q, low, high)
+                        states_raw_big.append(q)
+
+                else:
+                    # 有多于 1 个点：根据“线段长度”分配 M_path_eff 个样本
+                    seg_lens_safe = seg_lens + 1e-9
+                    total_len_safe = float(np.sum(seg_lens_safe))
+
+                    raw_counts = M_path_eff * seg_lens_safe / total_len_safe  # (T-1,)
+                    samples_per_seg = np.floor(raw_counts).astype(int)
+                    assigned = int(np.sum(samples_per_seg))
+                    remaining = M_path_eff - assigned
+
+                    if remaining > 0:
+                        frac = raw_counts - samples_per_seg
+                        order = np.argsort(-frac)   # 按小数部分降序
+                        for k in range(remaining):
+                            samples_per_seg[order[k]] += 1
+
+                    num_segs = T - 1
+                    for seg_id in range(num_segs):
+                        num_samples_seg = samples_per_seg[seg_id]
+                        if num_samples_seg <= 0:
+                            continue
+
+                        p0 = path_norm[seg_id]
+                        p1 = path_norm[seg_id + 1]
+
+                        for _ in range(num_samples_seg):
+                            # 在线段 [p0, p1] 上随机插值
+                            t = np.random.rand()
+                            base_norm = (1.0 - t) * p0 + t * p1
+
+                            # 在归一化空间里生成一个半径 <= PATH_DIST_THRESH 的随机扰动
+                            dir_noise = np.random.normal(size=D).astype(np.float32)
+                            norm = np.linalg.norm(dir_noise) + 1e-9
+                            dir_noise = dir_noise / norm
+
+                            r = PATH_DIST_THRESH * np.random.rand()  # [0, PATH_DIST_THRESH]
+                            noise_norm = dir_noise * r
+
+                            q_norm = base_norm + noise_norm
+                            q_norm = np.clip(q_norm, 0.0, 1.0)
+
+                            # 映射回原关节空间
+                            q = low + q_norm * span
+                            q = np.clip(q, low, high)
+                            states_raw_big.append(q)
+
+            # 最终检查：长度 ≈ M（防止整型舍入带来的 ±1 误差）
             states_raw_big = np.array(states_raw_big, dtype=np.float32)
+            if len(states_raw_big) != M:
+                if len(states_raw_big) > M:
+                    idx = np.random.choice(len(states_raw_big), size=M, replace=False)
+                    states_raw_big = states_raw_big[idx]
+                else:
+                    extra = M - len(states_raw_big)
+                    extra_samples = np.array([env_sim.uniform_sample() for _ in range(extra)], dtype=np.float32)
+                    states_raw_big = np.concatenate([states_raw_big, extra_samples], axis=0)
+
+
+
 
             free_mask_big = np.array([env_sim._state_fp(q) for q in states_raw_big], dtype=bool)
             is_collision_big = (~free_mask_big).astype(np.uint8)

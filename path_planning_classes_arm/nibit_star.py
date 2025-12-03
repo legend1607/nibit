@@ -21,8 +21,102 @@ import random
 
 INF = float("inf")
 
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # 触发 3D 投影注册
 
-class BITStar:
+
+def visualize_nn_predictions(
+    joints_np,
+    labels_pred,
+    joints=None,
+    title="NN predictions in joint space",
+    save_path=None,
+    show=True,
+):
+    """
+    可视化一批关节空间采样点的“预测标签”：
+      - label=0: 碰撞
+      - label=1: 自由空间
+      - label=2: 路径附近（path）
+    """
+    joints_np = np.asarray(joints_np, dtype=float)
+    labels_pred = np.asarray(labels_pred, dtype=int)
+
+    N, D = joints_np.shape
+    if D < 3:
+        raise ValueError(f"维度 D={D} < 3，无法做 3D 可视化")
+
+    if joints is None:
+        joints = np.random.choice(D, size=3, replace=False)
+    else:
+        joints = np.array(joints, dtype=int)
+        if joints.shape[0] != 3:
+            raise ValueError(f"joints 长度必须为3，当前为 {joints.shape[0]}")
+        if np.any(joints < 0) or np.any(joints >= D):
+            raise ValueError(f"关节索引越界，合法范围 0~{D-1}，得到 {joints}")
+    joints = np.sort(joints)
+
+    print(f"[NN VIS] 使用关节维度 (作为 XYZ) = {joints.tolist()}")
+
+    # 投影到选中的 3 维
+    pts_proj = joints_np[:, joints]  # (N,3)
+
+    # 构造 mask
+    mask_collision = (labels_pred == 0)
+    mask_free      = (labels_pred == 1)
+    mask_path      = (labels_pred == 2)
+
+    print(f"[NN VIS] 预测 label=2(path) 点数: {mask_path.sum()} / {N}")
+    print(f"[NN VIS] 预测 label=1(free) 点数: {mask_free.sum()} / {N}")
+    print(f"[NN VIS] 预测 label=0(coll) 点数: {mask_collision.sum()} / {N}")
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 自由空间点
+    if np.any(mask_free):
+        ax.scatter(
+            pts_proj[mask_free, 0],
+            pts_proj[mask_free, 1],
+            pts_proj[mask_free, 2],
+            c='g', s=4, alpha=0.25, label="NN free (1)"
+        )
+
+    # 碰撞点
+    if np.any(mask_collision):
+        ax.scatter(
+            pts_proj[mask_collision, 0],
+            pts_proj[mask_collision, 1],
+            pts_proj[mask_collision, 2],
+            c='r', s=4, alpha=0.5, marker="x", label="NN collision (0)"
+        )
+
+    # 路径点
+    if np.any(mask_path):
+        ax.scatter(
+            pts_proj[mask_path, 0],
+            pts_proj[mask_path, 1],
+            pts_proj[mask_path, 2],
+            c='b', s=8, alpha=0.9, label="NN path (2)"
+        )
+
+    ax.set_xlabel(f"joint {joints[0]}")
+    ax.set_ylabel(f"joint {joints[1]}")
+    ax.set_zlabel(f"joint {joints[2]}")
+    ax.set_title(title)
+    ax.legend(loc="best")
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300)
+        print(f"[NN VIS] 图已保存到: {save_path}")
+
+    if show:
+        plt.show()
+
+
+class NIBITStar:
     def __init__(
         self,
         start,
@@ -30,6 +124,7 @@ class BITStar:
         environment,
         iter_max,
         batch_size,
+        neural_wrapper,
         plot_flag=False,
         timer=None,
     ):
@@ -39,6 +134,7 @@ class BITStar:
             self.timer = timer
 
         self.env = environment
+        self.neural_wrapper = neural_wrapper
 
         # ---------- 关键：统一将 start/goal 转为可哈希 key ----------
         self.start = self.to_key(start)
@@ -175,12 +271,57 @@ class BITStar:
 
     def sample_from_env(self, c_best, batch_size, vertices=None):
         """
-        从椭圆域中进行 informed 采样。
-        如果采样失败次数过多，抛出异常让上层处理。
+        使用 informed sampling（椭圆 + 全局）产生候选关节点，
+        不做碰撞检测，统一交给神经网络打分：
+        - 使用 P(path) 做 Top-K 选点
         """
-        samples = []
 
-        # --- 回退到 uniform 采样 ---
+        def select_with_nn(candidates):
+            """
+            candidates: List[np.ndarray] 或 (N, dof) 的 array
+            返回：List[tuple]，长度 <= batch_size
+            """
+            if len(candidates) == 0:
+                return []
+
+            joints_np = np.array(candidates, dtype=float)
+
+            # 如果没有神经网络，就纯随机选
+            if self.neural_wrapper is None:
+                if len(joints_np) > batch_size:
+                    idx = np.random.choice(len(joints_np), size=batch_size, replace=False)
+                    joints_np = joints_np[idx]
+                return [self.to_key(p) for p in joints_np]
+
+            # 用网络预测得到各类概率
+            # 这里保留 get_path_mask 调用，为了兼容你现有接口和可视化
+            mask_path, probs = self.neural_wrapper.get_path_mask(
+                joints_np, cls=2, prob_th=None
+            )
+
+            # 如果你之前的 probs 顺序是 [collision, free, path]，
+            # 那么第 2 号通道就是 path 的概率：
+            p_path = probs[:, 2]
+
+            # 仍然可以算一下 argmax 做可视化
+            pred = np.argmax(probs, axis=-1)
+            visualize_nn_predictions(joints_np, pred)
+
+            # 按 P(path) 从大到小排序，取 Top-K
+            K = min(batch_size, len(joints_np))
+            top_idx = np.argsort(-p_path)[:K]   # 降序 Top-K
+            selected = joints_np[top_idx]
+
+            return [self.to_key(p) for p in selected]
+
+        # ------------------------------------------------
+        # 后面的主体逻辑不变
+        # ------------------------------------------------
+        candidates = []
+        oversample_factor = 10
+        M = batch_size * oversample_factor
+
+        # ---------- 情况 1：椭圆信息无效 → 全局 uniform 采样 ----------
         if (
             c_best is None
             or not np.isfinite(c_best)
@@ -189,34 +330,16 @@ class BITStar:
             or self.center_point is None
             or self.C is None
         ):
-            consecutive_failures = 0
-            max_consecutive_failures = 50  # 连续失败50次就放弃
-
-            for _ in range(batch_size * 10):
-                try:
-                    p = self.env.sample_empty_points()
-                    if p is not None:
-                        samples.append(self.to_key(p))
-                        consecutive_failures = 0  # 重置失败计数
-                    else:
-                        consecutive_failures += 1
-                except Exception:
-                    consecutive_failures += 1
-
-                # ✅ 如果连续失败太多次，说明环境有问题
-                if consecutive_failures >= max_consecutive_failures:
-                    raise RuntimeError(
-                        f"Failed to sample {batch_size} points. "
-                        f"Environment may be too crowded. "
-                        f"Only sampled {len(samples)} points."
-                    )
-
-                if len(samples) >= batch_size:
+            max_trials = M * 10
+            for _ in range(max_trials):
+                q = self.env.uniform_sample()
+                if q is not None:
+                    candidates.append(np.array(q, dtype=float))
+                if len(candidates) >= M:
                     break
+            return select_with_nn(candidates)
 
-            return samples
-
-        # --- 椭圆采样 ---
+        # ---------- 情况 2：椭圆信息有效 ----------
         a = c_best / 2.0
         b = math.sqrt(max(0.0, c_best**2 - self.c_min**2)) / 2.0
         L = np.diag([a] + [b] * (self.dimension - 1))
@@ -224,22 +347,17 @@ class BITStar:
         consecutive_failures = 0
         max_consecutive_failures = 50
 
-        for _ in range(batch_size * 10):
-            x_ball = self.sample_unit_ball()
-            x_ellipsoid = self.C @ (L @ x_ball) + self.center_point
-
+        for _ in range(M * 10):
             try:
-                if self.env._point_in_free_space(x_ellipsoid):
-                    samples.append(self.to_key(x_ellipsoid))
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
+                x_ball = self.sample_unit_ball()
+                x_ellipsoid = self.C @ (L @ x_ball) + self.center_point
+                candidates.append(np.array(x_ellipsoid, dtype=float))
+                consecutive_failures = 0
             except Exception:
-                # 回退尝试
                 try:
-                    p = self.env.sample_empty_points()
-                    if p is not None:
-                        samples.append(self.to_key(p))
+                    q = self.env.uniform_sample()
+                    if q is not None:
+                        candidates.append(np.array(q, dtype=float))
                         consecutive_failures = 0
                     else:
                         consecutive_failures += 1
@@ -247,16 +365,21 @@ class BITStar:
                     consecutive_failures += 1
 
             if consecutive_failures >= max_consecutive_failures:
-                raise RuntimeError(
-                    f"Failed to sample from ellipsoid. "
-                    f"Environment may be too crowded. "
-                    f"Only sampled {len(samples)} points."
-                )
-
-            if len(samples) >= batch_size:
+                break
+            if len(candidates) >= M:
                 break
 
-        return samples
+        # 不足就 uniform 补
+        if len(candidates) < M:
+            max_trials = (M - len(candidates)) * 10
+            for _ in range(max_trials):
+                q = self.env.uniform_sample()
+                if q is not None:
+                    candidates.append(np.array(q, dtype=float))
+                if len(candidates) >= M:
+                    break
+
+        return select_with_nn(candidates)
 
     def is_point_free(self, point):
         numeric = np.array(point, dtype=float)
@@ -293,9 +416,7 @@ class BITStar:
         return self.distance(point1, point2)
 
     def distance(self, point1, point2):
-        return np.linalg.norm(
-            np.array(point1, dtype=float) - np.array(point2, dtype=float)
-        )
+        return np.linalg.norm(np.array(point1, dtype=float) - np.array(point2, dtype=float))
 
     def get_edge_value(self, edge):
         return (
@@ -348,7 +469,6 @@ class BITStar:
 
     def prune_edge(self, c_best):
         """修剪边，但保护当前最优路径"""
-        # 获取当前路径上的点（需要保护）
         path_points = self.get_current_path_points()
 
         edge_array = list(self.edges.items())
@@ -356,17 +476,14 @@ class BITStar:
             point = self.to_key(point)
             parent = self.to_key(parent)
 
-            # 关键：不要删除当前最优路径上的边
             if point in path_points:
                 continue
 
-            # 删除超出椭圆域的边
             if self.get_f_score(point) > c_best or self.get_f_score(parent) > c_best:
                 self.edges.pop(point, None)
 
     def prune(self, c_best):
         """修剪顶点和边，但保护当前最优路径"""
-        # 先保护当前路径
         path_points = self.get_current_path_points()
 
         # 修剪样本点
@@ -374,7 +491,7 @@ class BITStar:
             point for point in self.samples if self.get_f_score(point) < c_best
         ]
 
-        # 修剪边（保护当前路径）
+        # 修剪边
         self.prune_edge(c_best)
 
         # 修剪顶点
@@ -383,7 +500,6 @@ class BITStar:
             point = self.to_key(point)
             f = self.get_f_score(point)
 
-            # 保护当前路径上的点
             if point in path_points:
                 vertices_temp.append(point)
                 continue
@@ -400,9 +516,7 @@ class BITStar:
         self.timer.start()
 
         # neighbors among samples within radius
-        neigbors_sample = [
-            s for s in self.samples if self.distance(point, s) <= self.r
-        ]
+        neigbors_sample = [s for s in self.samples if self.distance(point, s) <= self.r]
         self.timer.finish(Timer.NN)
 
         self.timer.start()
@@ -432,9 +546,10 @@ class BITStar:
                         + self.heuristic_cost(neighbor, self.goal)
                     )
                     if estimated_f_score < self.get_g_score(self.goal):
-                        estimated_g_score = self.get_g_score(
-                            point
-                        ) + self.heuristic_cost(point, neighbor)
+                        estimated_g_score = (
+                            self.get_g_score(point)
+                            + self.heuristic_cost(point, neighbor)
+                        )
                         if estimated_g_score < self.get_g_score(neighbor):
                             heapq.heappush(
                                 self.edge_queue,
@@ -454,18 +569,16 @@ class BITStar:
 
         path.append(self.goal)
         point = self.goal
-        visited = set()  # 防止无限循环
+        visited = set()
         max_iterations = len(self.vertices) + 100
         iteration = 0
 
         while point != self.start and iteration < max_iterations:
-            # 添加循环检测
             if point in visited:
                 print(f"Warning: Cycle detected at {point}")
                 return []
             visited.add(point)
 
-            # 检查父节点是否存在
             if point not in self.edges:
                 print(f"Warning: Point {point} has no parent in edges")
                 print(f"Current point g_score: {self.g_scores.get(point, 'N/A')}")
@@ -473,10 +586,10 @@ class BITStar:
                 print(
                     f"Total edges: {len(self.edges)}, Total vertices: {len(self.vertices)}"
                 )
-                return []  # 返回空路径而不是崩溃
+                return []
 
             parent = self.edges[point]
-            parent = self.to_key(parent)  # 确保 key 一致性
+            parent = self.to_key(parent)
             path.append(parent)
             point = parent
             iteration += 1
@@ -496,21 +609,23 @@ class BITStar:
 
     def planning(self, visualize=False, refresh_interval=1):
         """
-        返回值（为兼容旧代码，compare_planning 会用可变解包）：
-        - path
-        - samples
-        - edges
-        - n_checks
-        - best_cost
-        - total_samples
-        - runtime
-        - final_iter
-        - iteration_costs
-        - iteration_times                # ✅ 新增：每次迭代的累计时间
-        - first_solution_iter (可选，1-based)
-        - first_solution_cost (可选)
-        - first_solution_nodes (可选)
-        - final_solution_nodes (可选)
+        返回值格式与增强版 BITStar 对齐：
+        (
+            path,
+            samples,
+            edges,
+            n_checks,
+            best_cost,
+            total_samples,
+            runtime,
+            final_iter,
+            iteration_costs,
+            iteration_times,          # ✅ 新增：每次迭代的累计时间
+            first_solution_iter,
+            first_solution_cost,
+            first_solution_nodes,
+            final_solution_nodes,
+        )
         """
         no_improve_limit = 100
         no_improve_count = 0
@@ -521,13 +636,12 @@ class BITStar:
 
         init_time = time()
         iteration_costs = []
-        iteration_times = []   # ✅ 新增：记录每次迭代的累计时间
+        iteration_times = []   # ✅ 新增
 
         # 额外记录：第一次解 / 最终解信息
         first_solution_iter = None
         first_solution_cost = None
         first_solution_nodes = None
-
         final_solution_nodes = 0
 
         for k in range(self.iter_max):
@@ -537,9 +651,7 @@ class BITStar:
             if not self.vertex_queue and not self.edge_queue:
                 c_best = self.get_g_score(self.goal)
                 self.prune(c_best)
-                new_samples = self.sample_from_env(
-                    c_best, self.batch_size, self.vertices
-                )
+                new_samples = self.sample_from_env(c_best, self.batch_size, self.vertices)
                 new_samples = [self.to_key(p) for p in new_samples]
                 self.samples.extend(new_samples)
                 self.T += self.batch_size
@@ -567,20 +679,18 @@ class BITStar:
                     self.expand_vertex(point)
             except Exception as e:
                 if (not self.edge_queue) and (not self.vertex_queue):
-                    # 没有可扩展的点/边，本轮就只记录一下 cost 然后继续
-                    current_time = time() - init_time
-                    iteration_times.append(current_time)
+                    # 队列都空了，当前迭代无法扩展，记录 cost & time 后继续
                     iteration_costs.append(self.get_g_score(self.goal))
+                    iteration_times.append(time() - init_time)   # ✅
                     continue
                 else:
                     raise e
 
             # 3. 选取最优边并扩展树
             if not self.edge_queue:
-                # 没有可扩展的边，记录当前 best_cost，然后进入下一次迭代
-                current_time = time() - init_time  # ✅ 新增
-                iteration_times.append(current_time)
+                # 为了和 BITStar 一致，这里也记录一下当前 cost & time
                 iteration_costs.append(self.get_g_score(self.goal))
+                iteration_times.append(time() - init_time)       # ✅
                 continue
 
             best_edge_value, bestEdge = heapq.heappop(self.edge_queue)
@@ -599,7 +709,6 @@ class BITStar:
                         self.get_g_score(bestEdge[0]) + actual_cost_of_edge
                     )
                     if actual_g_score_of_point < self.get_g_score(bestEdge[1]):
-                        # 确保所有 key 都经过 to_key 处理
                         point_key = self.to_key(bestEdge[1])
                         parent_key = self.to_key(bestEdge[0])
 
@@ -634,17 +743,15 @@ class BITStar:
                 self.vertex_queue = []
                 self.edge_queue = []
 
-            # 4. Update path
+            # 4. Update path & 记录 cost / time / 第一次解
             self.path = self.get_best_path()
             g_goal = self.get_g_score(self.goal)
-
-            current_time = time() - init_time  # ✅ 新增
-            iteration_times.append(current_time)
             iteration_costs.append(g_goal)
+            iteration_times.append(time() - init_time)          # ✅
 
             current_cost = g_goal
 
-            # 记录第一次找到可行解的迭代 / cost / 节点数
+            # 第一次可行解
             if first_solution_iter is None and np.isfinite(g_goal):
                 first_solution_iter = k + 1  # 1-based
                 first_solution_cost = g_goal
@@ -685,7 +792,7 @@ class BITStar:
                 if abs(current_len - straight_len) <= 1e-8:
                     break
 
-        # 记录最终路径节点数（优化后）
+        # 最终路径节点数
         final_solution_nodes = len(self.path) if self.path else 0
 
         return (
@@ -698,24 +805,24 @@ class BITStar:
             time() - init_time,
             final_iter,
             iteration_costs,
-            iteration_times,          # ✅ 新增返回值：时间序列
-            first_solution_iter,
-            first_solution_cost,
-            first_solution_nodes,
-            final_solution_nodes,
+            # iteration_times,         # ✅ 新增
+            # first_solution_iter,
+            # first_solution_cost,
+            # first_solution_nodes,
+            # final_solution_nodes,
         )
-
 
 def get_bit_planner(
     args,
     problem,
     neural_wrapper=None,
 ):
-    planner = BITStar(
+    planner = NIBITStar(
         problem["start"],
         problem["goal"],
         problem["env"],
         args.iter_max,
         args.batch_size,
+        neural_wrapper,
     )
     return planner

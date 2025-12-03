@@ -146,7 +146,7 @@ def main(args):
     model = JointPointNetEncoder(
         joint_in_dim=joint_in_dim,
         joint_feat_dim=64,
-        env_latent_dim=60,
+        env_latent_dim=32,
         pointnet_embed_dim=256,
         num_classes=3,
         dropout_p=0,

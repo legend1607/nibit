@@ -61,8 +61,8 @@ def get_problem_input(path_planner,random_2d_env_config):
     goal = tuple(env_dict['goal'][0])
     if path_planner in ["BITStar","RRTStar","IRRTStar"]:
         env=Random2DEnv(env_dict, mode="test")
-    elif path_planner=="KinoBITStar":
-        env=Random2DKinodynamicEnv(env_dict, mode="test")
+    # elif path_planner=="KinoBITStar":
+    #     env=Random2DKinodynamicEnv(env_dict, mode="test")
     problem = {}
     problem['start'] = start
     problem['goal'] = goal
@@ -103,12 +103,12 @@ if __name__ == "__main__":
     if args.path_planner == "BITStar":
         from path_planning_classes.bit_star import get_bit_planner
         path_planner = get_bit_planner(args, problem, neural_wrapper)
-    elif args.path_planner == "KinoBITStar":
-        from kino_planning_classes.bit_star import get_bit_planner
-        path_planner = get_bit_planner(args, problem, neural_wrapper)
-    elif args.path_planner == "Kinofmt":
-        from kino_planning_classes.fmt import get_planner as get_planner
-        path_planner = get_planner(args, problem, neural_wrapper)
+    # elif args.path_planner == "KinoBITStar":
+    #     from kino_planning_classes.bit_star import get_bit_planner
+    #     path_planner = get_bit_planner(args, problem, neural_wrapper)
+    # elif args.path_planner == "Kinofmt":
+    #     from kino_planning_classes.fmt import get_planner as get_planner
+    #     path_planner = get_planner(args, problem, neural_wrapper)
     elif args.path_planner == "RRTStar":
         from path_planning_classes.rrt_star_2d import get_path_planner
         path_planner = get_path_planner(args, problem, neural_wrapper)

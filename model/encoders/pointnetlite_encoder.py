@@ -1,37 +1,176 @@
 import torch
 import torch.nn as nn
 
-from model.modules.builders import build_shared_mlp
+
+class FastSharedMLP(nn.Module):
+    """
+    与 build_shared_mlp 等价，但使用 Linear + reshape，
+    在 conv_dim=1 （PointNet 标准）下速度更快。
+    """
+    def __init__(self, dims):
+        super().__init__()
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ReLU(inplace=True))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):       # x: (B, N, C_in)
+        B, N, C = x.shape
+        x = self.mlp(x)         # (B, N, C_out)
+        return x
+
 
 class PointNetLiteEncoder(nn.Module):
-    def __init__(self, in_dim=3, embed_dim=1024, hidden_dims=[64, 128], conv_dim=1, return_all=False):
-        """
-        conv_dim (int): default=1; set to 2 if working with grouped points (B, G, S, C)
-        return_all (bool): If True, return global_feat (B, embed_dim), local_feat (B, N, embed_dim)
-        """
+    """
+    原始 Lite 版 PointNet 编码器：
+    - 移除多余 permute
+    - Linear 替代 Conv1d(kernel=1)
+    - 用 torch.amax 加速 max pooling
+    """
+    def __init__(self, in_dim=3, embed_dim=1024, hidden_dims=[64, 128],
+                 conv_dim=1, return_all=False):
         super().__init__()
-        self.grouped = False if conv_dim == 1 else True
+        self.grouped = (conv_dim != 1)
         self.return_all = return_all
-        self.mlp = build_shared_mlp([in_dim] + hidden_dims + [embed_dim], conv_dim=conv_dim)
 
-    def forward(self, x):   # (B, N, in_dim) or grouped points (B, G, S, in_dim)
-        if self.grouped:
-            x = x.permute(0, 3, 2, 1)     # (B, in_dim, S, G)
+        # 构建 MLP：等价替代 build_shared_mlp
+        mlp_dims = [in_dim] + hidden_dims + [embed_dim]
+
+        if not self.grouped:
+            # 标准 PointNet flow (B, N, C)
+            self.mlp = FastSharedMLP(mlp_dims)
         else:
-            x = x.permute(0, 2, 1)        # (B, in_dim, N)
-            
+            # grouped 情况保持一致（仍使用 conv）
+            from model.modules.builders import build_shared_mlp
+            self.mlp = build_shared_mlp(mlp_dims, conv_dim=2)
 
-        feat = self.mlp(x)   # (B, embed_dim, N) or (B, embed_dim, S, G)
-        global_feat = torch.max(feat, dim=2)[0]  # maxpool over N/S; (B, embed_dim, (G))
+    def forward(self, x):
+        """
+        x:
+            - (B, N, C)   if not grouped
+            - (B, G, S, C) if grouped
+        """
+        if not self.grouped:
+            # 保持 (B, N, C)，Linear 直接处理
+            feat = self.mlp(x)                      # (B, N, embed_dim)
+            global_feat = torch.amax(feat, dim=1)   # (B, embed_dim)
 
-        if self.grouped:
-            global_feat = global_feat.permute(0, 2, 1)   # (B, G, embed_dim)
+            if self.return_all:
+                return global_feat, feat            # (B, embed_dim), (B, N, embed_dim)
+            return global_feat
 
-        if self.return_all:
-            if self.grouped:
-                local_feat = feat.permute(0, 3, 2, 1)  # (B, G, S, embed_dim)
-            else:
-                local_feat = feat.permute(0, 2, 1)  # (B, N, embed_dim)
-            return global_feat, local_feat
-            
-        return global_feat
+        else:
+            # grouped 情况：保持你原来的逻辑
+            x = x.permute(0, 3, 2, 1)
+            feat = self.mlp(x)
+            global_feat = torch.amax(feat, dim=2)
+
+            global_feat = global_feat.permute(0, 2, 1)
+
+            if self.return_all:
+                local_feat = feat.permute(0, 3, 2, 1)
+                return global_feat, local_feat
+            return global_feat
+
+
+# ----------------------------------------------------------------------
+# AttentionPointNet：用于替换 JointPointNetEncoder 里的 PointNetLiteEncoder
+#   - per-point MLP 提升维度
+#   - Self-Attention 沿 N 维建模点与点之间的关系
+#   - Attention Pooling 获取可学习的 global feature
+# ----------------------------------------------------------------------
+class AttentionPointNet(nn.Module):
+    """
+    输入:  x (B, N, C_in)
+    输出:  global_feat (B, embed_dim)
+          local_feat  (B, N, embed_dim)
+    """
+    def __init__(
+        self,
+        in_dim: int = 3,
+        embed_dim: int = 256,
+        hidden_dims = [128, 256],
+        num_heads: int = 4,
+        num_layers: int = 2,
+        attn_dropout: float = 0.1,   # Transformer 内部的 dropout
+        ff_multiplier: float = 2.0,
+        use_attn_pool: bool = True,
+        mlp_dropout: float = 0.1,    # 🔥 新增：per-point MLP dropout
+        feat_dropout: float = 0.1    # 🔥 新增：self-attn 之后的 dropout
+    ):
+        super().__init__()
+
+        # 1) per-point MLP: (B, N, in_dim) -> (B, N, embed_dim)
+        mlp_layers = []
+        dims = [in_dim] + list(hidden_dims) + [embed_dim]
+        for i in range(len(dims) - 1):
+            mlp_layers.append(nn.Linear(dims[i], dims[i + 1]))
+            # 最后一层不加激活和 dropout
+            if i != len(dims) - 2:
+                mlp_layers.append(nn.ReLU(inplace=True))
+                if mlp_dropout > 0:
+                    mlp_layers.append(nn.Dropout(mlp_dropout))
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        # 2) Self-Attention：沿着 N 维，让每个点看到所有其他点
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * ff_multiplier),
+            dropout=attn_dropout,      # attention + FFN 里面自带 dropout
+            batch_first=True,
+            activation="relu",
+            norm_first=True
+        )
+        self.self_attn = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        # self-attn 之后再丢一点特征，防止过拟合太严重
+        if feat_dropout > 0:
+            self.feat_dropout = nn.Dropout(feat_dropout)
+        else:
+            self.feat_dropout = nn.Identity()
+
+        self.use_attn_pool = use_attn_pool
+
+        # 3) Attention Pooling：学习每个点对全局特征的贡献
+        if self.use_attn_pool:
+            self.attn_pool = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(inplace=True),
+                # 这里一般不需要太大 dropout，先不加也可以
+                # 如果后面还明显过拟合，可以在这里再加一个 Dropout
+                # nn.Dropout(0.1),
+                nn.Linear(embed_dim // 2, 1)
+            )
+        else:
+            self.attn_pool = None
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: (B, N, C_in)
+        return:
+            global_feat: (B, embed_dim)
+            local_feat:  (B, N, embed_dim)
+        """
+        # per-point MLP
+        feat = self.mlp(x)               # (B, N, embed_dim)
+
+        # self-attention：显式建模点与点之间的依赖
+        feat = self.self_attn(feat)      # (B, N, embed_dim)
+        feat = self.feat_dropout(feat)   # 🔥 self-attn 后再丢一点
+        local_feat = feat
+
+        # 全局特征
+        if self.attn_pool is not None:
+            # (B, N, E) -> (B, N, 1)
+            weights = self.attn_pool(local_feat)
+            weights = torch.softmax(weights, dim=1)               # 对 N 维做 softmax
+            global_feat = torch.sum(local_feat * weights, dim=1)  # (B, E)
+        else:
+            global_feat = torch.amax(local_feat, dim=1)           # fallback: max pooling
+
+        return global_feat, local_feat

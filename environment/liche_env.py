@@ -71,8 +71,8 @@ class LicheEnv:
             self.cid = p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
             p.resetDebugVisualizerCamera(
-                cameraDistance=3, cameraYaw=-90, cameraPitch=-40,
-                cameraTargetPosition=[0, 1, 0]
+                cameraDistance=5, cameraYaw=90, cameraPitch=-40,
+                cameraTargetPosition=[0, 0, 0]
             )
         else:
             self.cid = p.connect(p.DIRECT)
