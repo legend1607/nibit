@@ -273,7 +273,8 @@ class NIBITStar:
         """
         使用 informed sampling（椭圆 + 全局）产生候选关节点，
         不做碰撞检测，统一交给神经网络打分：
-        - 使用 P(path) 做 Top-K 选点
+        - 优先选择预测为 label=2 的“路径点”
+        - 不够再从 label=1 的“自由点”中补齐
         """
 
         def select_with_nn(candidates):
@@ -293,29 +294,48 @@ class NIBITStar:
                     joints_np = joints_np[idx]
                 return [self.to_key(p) for p in joints_np]
 
-            # 用网络预测得到各类概率
-            # 这里保留 get_path_mask 调用，为了兼容你现有接口和可视化
+            # 用预测网络拿 label=2 / label=1
             mask_path, probs = self.neural_wrapper.get_path_mask(
                 joints_np, cls=2, prob_th=None
             )
-
-            # 如果你之前的 probs 顺序是 [collision, free, path]，
-            # 那么第 2 号通道就是 path 的概率：
-            p_path = probs[:, 2]
-
-            # 仍然可以算一下 argmax 做可视化
             pred = np.argmax(probs, axis=-1)
-            visualize_nn_predictions(joints_np, pred)
+            visualize_nn_predictions(joints_np,pred)
+            path_pts = joints_np[mask_path]
+            free_pts = joints_np[(pred == 1) & (~mask_path)]
+            other_pts = joints_np[(pred != 2) & (pred != 1)]
 
-            # 按 P(path) 从大到小排序，取 Top-K
-            K = min(batch_size, len(joints_np))
-            top_idx = np.argsort(-p_path)[:K]   # 降序 Top-K
-            selected = joints_np[top_idx]
+            # ① 先取 path 点
+            if len(path_pts) >= batch_size:
+                idx = np.random.choice(len(path_pts), size=batch_size, replace=False)
+                selected = path_pts[idx]
+            else:
+                if len(path_pts) > 0:
+                    selected = path_pts.copy()
+                else:
+                    selected = np.empty((0, joints_np.shape[1]), dtype=float)
 
-            return [self.to_key(p) for p in selected]
+                # ② 再从 free 点补
+                remain = batch_size - len(selected)
+                if remain > 0 and len(free_pts) > 0:
+                    if len(free_pts) > remain:
+                        idx = np.random.choice(len(free_pts), size=remain, replace=False)
+                        selected = np.vstack([selected, free_pts[idx]])
+                    else:
+                        selected = np.vstack([selected, free_pts])
+
+                # ③ 还不够就从其他点里补
+                remain = batch_size - len(selected)
+                if remain > 0 and len(other_pts) > 0:
+                    if len(other_pts) > remain:
+                        idx = np.random.choice(len(other_pts), size=remain, replace=False)
+                        selected = np.vstack([selected, other_pts[idx]])
+                    else:
+                        selected = np.vstack([selected, other_pts])
+
+            return [self.to_key(p) for p in selected[:batch_size]]
 
         # ------------------------------------------------
-        # 后面的主体逻辑不变
+        # 主体逻辑
         # ------------------------------------------------
         candidates = []
         oversample_factor = 10

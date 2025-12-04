@@ -241,7 +241,7 @@ def get_problem_input(
     start = tuple(starts[traj_index])
     goal = tuple(goals[traj_index])
 
-    env = rebuild_env_from_record(env_record, gui=False)
+    env = rebuild_env_from_record(env_record, gui=True)
 
     problem = {
         "start": start,
@@ -453,6 +453,8 @@ def main():
             pose_interval=5,     # 每隔多少个插值点放一个机械臂
             sleep_interval=0.03, # 动画速度
             interp_step=0.05,    # 插值步长，越小越平滑
+            save_curve=True,
+            save_file="traj_001.csv"
         )
     else:
         print("[WARN] 未找到路径，无法调用 env.render_path。")
