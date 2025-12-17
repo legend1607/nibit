@@ -1,24 +1,26 @@
-# dataset.py
-
 import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Union
+from typing import Union, Tuple, List, Dict, Any
 
-def collate_fn_with_meta(batch):
+
+def collate_fn_with_meta_and_pathlabel(batch):
     """
-    batch: list of (env_voxel, joint_states, labels, meta)
-    只对前三个做默认拼接，meta 保持成 list，不去 stack 里面的 path 等可变长内容
+    batch: list of (env_voxel, joint_states, labels, pathlabels, meta)
+
+    只对 env_voxel / joint_states / labels / pathlabels 拼接，
+    meta 保持成 list，不去 stack 里面的 path 等可变长内容
     """
-    env_voxels, joint_states, labels, metas = zip(*batch)  # 解包
+    env_voxels, joint_states, labels, pathlabels, metas = zip(*batch)
 
-    env_voxels = torch.stack(env_voxels, dim=0)   # (B, 1, D, H, W)
-    joint_states = torch.stack(joint_states, dim=0)  # (B, N, DoF)
-    labels = torch.stack(labels, dim=0)           # (B, N)
+    env_voxels = torch.stack(env_voxels, dim=0)        # (B, 1, D, H, W)
+    joint_states = torch.stack(joint_states, dim=0)   # (B, N, DoF)
+    labels = torch.stack(labels, dim=0)               # (B, N)
+    pathlabels = torch.stack(pathlabels, dim=0)       # (B, N)
 
-    # metas 直接作为 tuple/list 返回，不做进一步拼接
-    return env_voxels, joint_states, labels, list(metas)
+    return env_voxels, joint_states, labels, pathlabels, list(metas)
+
 
 class ArmPointCloudDataset(Dataset):
     """
@@ -27,7 +29,8 @@ class ArmPointCloudDataset(Dataset):
     期望 npz 中至少包含：
         - voxel_grids: (M, D, H, W)
         - pc:          (M, N, DoF)
-        - labels:      (M, N)
+        - labels:      (M, N)   二分类: 0=collision, 1=free
+        - pathlabels:  (M, N)   软标签 float32 in [0,1], 越小 dist 越接近 1
     """
 
     def __init__(
@@ -35,8 +38,9 @@ class ArmPointCloudDataset(Dataset):
         npz_path: str,
         max_points: int = None,
         shuffle_points: bool = False,
-        device: Union[torch.device, str, None] = None,  # 修复这里
+        device: Union[torch.device, str, None] = None,
         dtype: torch.dtype = torch.float32,
+        require_pathlabels: bool = True,  # 如果你有旧数据集可设 False 兼容
     ):
         super().__init__()
         self.npz_path = npz_path
@@ -44,18 +48,35 @@ class ArmPointCloudDataset(Dataset):
         self.shuffle_points = shuffle_points
         self.device = torch.device(device) if device is not None else None
         self.dtype = dtype
+        self.require_pathlabels = require_pathlabels
 
         if not os.path.isfile(npz_path):
             raise FileNotFoundError(f"NPZ file not found: {npz_path}")
 
-        # 重要：obstacles/path 之类是 object，需要 allow_pickle=True
         data = np.load(npz_path, allow_pickle=True)
 
-        self.voxel_grids = data["voxel_grids"]      # (M, D, H, W)
-        self.pc = data["pc"]                        # (M, N, DoF)
-        self.labels = data["labels"]                # (M, N)
-        print("self.pc,",self.pc.shape)
-        # optional fields
+        # ---- required fields ----
+        self.voxel_grids = data["voxel_grids"]  # (M, D, H, W)
+        self.pc = data["pc"]                    # (M, N, DoF)
+        self.labels = data["labels"]            # (M, N)
+
+        # ---- new optional/required field ----
+        if "pathlabels" in data.files:
+            self.pathlabels = data["pathlabels"]  # (M, N) float32
+        else:
+            self.pathlabels = None
+            if self.require_pathlabels:
+                raise KeyError(
+                    f"`pathlabels` not found in {npz_path}. "
+                    f"Please regenerate dataset with soft pathlabels."
+                )
+
+        print("self.pc:", self.pc.shape)
+        print("self.labels:", self.labels.shape)
+        if self.pathlabels is not None:
+            print("self.pathlabels:", self.pathlabels.shape)
+
+        # ---- optional meta fields ----
         self.starts = data["starts"] if "starts" in data.files else None
         self.goals = data["goals"] if "goals" in data.files else None
         self.env_ranges = data["env_ranges"] if "env_ranges" in data.files else None
@@ -74,7 +95,10 @@ class ArmPointCloudDataset(Dataset):
     def __len__(self):
         return self.num_envs
 
-    def _maybe_sample_points(self, pc_i, labels_i):
+    def _maybe_sample_points(self, pc_i, labels_i, pathlabels_i=None):
+        """
+        对 pc / labels / pathlabels 同步子采样
+        """
         N = pc_i.shape[0]
         if self.max_points is None or self.max_points >= N:
             idx = np.arange(N)
@@ -84,22 +108,38 @@ class ArmPointCloudDataset(Dataset):
         if self.shuffle_points:
             np.random.shuffle(idx)
 
-        return pc_i[idx], labels_i[idx]
+        pc_o = pc_i[idx]
+        labels_o = labels_i[idx]
+        if pathlabels_i is None:
+            return pc_o, labels_o, None
+        else:
+            return pc_o, labels_o, pathlabels_i[idx]
 
     def __getitem__(self, idx):
         voxel = self.voxel_grids[idx]
         pc_i = self.pc[idx]
         labels_i = self.labels[idx]
 
-        pc_i, labels_i = self._maybe_sample_points(pc_i, labels_i)
+        if self.pathlabels is not None:
+            pathlabels_i = self.pathlabels[idx]
+        else:
+            pathlabels_i = None
 
-        # 必须 clone()，必须是 CPU
-        env_voxel = torch.from_numpy(voxel).clone().unsqueeze(0).to(self.dtype)
-        joint_states = torch.from_numpy(pc_i).clone().to(self.dtype)
-        labels_t = torch.from_numpy(labels_i).clone().long()
+        pc_i, labels_i, pathlabels_i = self._maybe_sample_points(pc_i, labels_i, pathlabels_i)
 
-        # meta 保持 CPU + 不要在 DataLoader 里堆叠
-        meta = {}
+        # ---- tensors ----
+        env_voxel = torch.from_numpy(voxel).clone().unsqueeze(0).to(self.dtype)   # (1, D, H, W)
+        joint_states = torch.from_numpy(pc_i).clone().to(self.dtype)              # (N, DoF)
+        labels_t = torch.from_numpy(labels_i).clone().long()                      # (N,)
+
+        if pathlabels_i is not None:
+            pathlabels_t = torch.from_numpy(pathlabels_i).clone().to(self.dtype)  # (N,)
+        else:
+            # 兼容旧数据：全 0
+            pathlabels_t = torch.zeros_like(labels_t, dtype=self.dtype)
+
+        # ---- meta stays on CPU ----
+        meta: Dict[str, Any] = {}
         if self.starts is not None:
             meta["start"] = torch.from_numpy(self.starts[idx]).clone().to(self.dtype)
         if self.goals is not None:
@@ -111,6 +151,7 @@ class ArmPointCloudDataset(Dataset):
         if self.paths is not None:
             meta["path"] = torch.from_numpy(self.paths[idx]).clone().to(self.dtype)
         if self.obstacles is not None:
-            meta["obstacles"] = self.obstacles[idx]  # 不转 tensor，保持原样
+            meta["obstacles"] = self.obstacles[idx]
 
-        return env_voxel, joint_states, labels_t, meta
+        # return 5-tuple
+        return env_voxel, joint_states, labels_t, pathlabels_t, meta

@@ -49,6 +49,17 @@ def parse_args():
         help='if set, randomly choose this many joint states per env for evaluation'
     )
 
+    # ★ 明确区分 单任务 / 多任务 / 两者都跑
+    parser.add_argument(
+        '--eval_mode',
+        type=str,
+        default='single',
+        choices=['single', 'multi', 'both'],
+        help='single: 只跑单任务（单环境延迟 benchmark）；'
+             'multi: 只跑多任务（全 test 集评估）；'
+             'both: 两者都跑'
+    )
+
     return parser.parse_args()
 
 
@@ -56,12 +67,27 @@ def parse_args():
 # 单样本 benchmark：随机环境 + 随机关节
 # 每个 voxel 只算一次 env_feat，后面只跑 forward_with_env_feat
 # ================================================================
-def benchmark_single_sample(model, dataset, device, log_fn=print,
-                            warmup=10, num_run=50, num_env=5, max_points=None):
+def benchmark_single_sample(
+    model,
+    dataset,
+    device,
+    log_fn=print,
+    warmup=10,
+    num_run=50,
+    num_env=1,
+    max_points=None,
+    near_thresh=0.5,
+    vis_out_dir=None,
+):
     """
-    随机选 num_env 个环境；每个环境再随机选 max_points 个关节角度点做 benchmark。
-    - CNN 只算一次 env_feat，单独计时
-    - MLP+PointNetLite 在同一个 env_feat 上跑 num_run 次，计平均时间
+    单任务（Single-task）延迟 benchmark，label 为 collision/free (0/1)，并可视化 path_gt/path_pred。
+
+    - 随机选 num_env 个 env；
+    - 每个 env 随机选最多 max_points 个关节角度点；
+    - 对每个 env，只算一次 env_feat，多次前向 head 计时；
+    - path_gt  : 由 GT distance (dist_gt < near_thresh) 决定；
+    - path_pred: 由模型预测 distance (dist_pred < near_thresh) 决定。
+    - 可视化：左图 path_gt，右图 path_pred。
     """
     model.eval()
     import random
@@ -71,48 +97,83 @@ def benchmark_single_sample(model, dataset, device, log_fn=print,
     head_times = []
     M_record = None
 
-    for idx in indices:
-        sample = dataset[idx]
-        env_voxel, joint_states, labels, meta = sample   # joint_states: (N, dof)
+    if vis_out_dir is None:
+        vis_out_dir = os.path.join(
+            "results", "model_training", "liche_pointnet", "figures", "single_task_ispath"
+        )
+    os.makedirs(vis_out_dir, exist_ok=True)
 
-        # ---------- 随机关节角度子集 ----------
+    for sample_idx, idx in enumerate(indices):
+        sample = dataset[idx]
+
+        # 假设 sample = (env_voxel, joint_states, labels, distances, meta)
+        if len(sample) == 5:
+            env_voxel, joint_states, labels, distances, meta = sample
+        elif len(sample) == 4:
+            env_voxel, joint_states, labels, meta = sample
+            distances = None
+        else:
+            raise ValueError(f"Unexpected sample length {len(sample)} from dataset[idx].")
+
         N = joint_states.shape[0]
+
+        # 子采样点
         if max_points is not None and N > max_points:
             perm = torch.randperm(N)[:max_points]
-            joint_states = joint_states[perm]    # (max_points, dof)
-            if labels is not None:
-                labels = labels[perm]
-        # -------------------------------------
+            joint_states = joint_states[perm]
+            labels = labels[perm]
+            if distances is not None:
+                distances = distances[perm]
+            N = joint_states.shape[0]
 
-        env_voxel = env_voxel.unsqueeze(0).to(device)        # (1, 1, D, H, W)
-        joint_states = joint_states.unsqueeze(0).to(device)  # (1, M, dof) M=子采样后点数
-        B, M, _ = joint_states.shape  # B=1
+        env_voxel_b = env_voxel.unsqueeze(0).to(device)        # (1,1,D,H,W)
+        joint_states_b = joint_states.unsqueeze(0).to(device)  # (1,M,dof)
+        labels_b = labels.to(device)                           # (M,)
+        B, M, _ = joint_states_b.shape
         M_record = M
 
-        # warmup：用真实流程（encode_env + forward_with_env_feat）预热
+        # GT distance
+        if distances is not None:
+            dist_gt_b = distances.to(device).view(1, -1)       # (1,M)
+        else:
+            dist_gt_b = None
+
+        # warmup
         with torch.no_grad():
             for _ in range(warmup):
-                env_feat = model.encode_env(env_voxel)
-                _ = model.forward_with_env_feat(env_feat, joint_states)
+                env_feat = model.encode_env(env_voxel_b)
+                _ = model.forward_with_env_feat(env_feat, joint_states_b)
 
-        # 1）CNN 一次性算 env_feat
+        # CNN 一次
         with torch.no_grad():
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.time()
-            env_feat = model.encode_env(env_voxel)
+            env_feat = model.encode_env(env_voxel_b)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t1 = time.time()
         cnn_dt = t1 - t0
 
-        # 2）在同一个 env_feat 上多次评估 joint_states，只计 head 部分
+        # 先跑一次 head 拿 dist_pred
         with torch.no_grad():
+            out = model.forward_with_env_feat(env_feat, joint_states_b)
+            if isinstance(out, (list, tuple)) and len(out) >= 2:
+                logits = out[0]
+                dist_pred_b = out[1]  # (1,M) or (1,M,1)
+            else:
+                logits = out
+                dist_pred_b = None
+
+            if dist_pred_b is not None:
+                dist_pred_b = dist_pred_b.view(1, -1)          # (1,M)
+
+            # 正式计时：只计 head
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t2 = time.time()
             for _ in range(num_run):
-                _ = model.forward_with_env_feat(env_feat, joint_states)
+                _ = model.forward_with_env_feat(env_feat, joint_states_b)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t3 = time.time()
@@ -121,22 +182,44 @@ def benchmark_single_sample(model, dataset, device, log_fn=print,
         cnn_times.append(cnn_dt)
         head_times.append(head_dt)
 
+        log_fn(
+            f"[SINGLE-TASK] Env idx={idx}: "
+            f"M={M}, cnn={cnn_dt*1000:.3f}ms, head={head_dt*1000:.3f}ms"
+        )
+
+        # === 可视化：左 path_gt，右 path_pred ===
+        dist_gt_1d = dist_gt_b.squeeze(0) if dist_gt_b is not None else None
+        dist_pred_1d = dist_pred_b.squeeze(0) if dist_pred_b is not None else None
+
+        visualize_ispath_two_panel(
+            joint_states=joint_states,  # (M,dof), CPU tensor
+            labels=labels,              # (M,),   CPU tensor
+            dist_gt=dist_gt_1d.cpu() if dist_gt_1d is not None else None,
+            dist_pred=dist_pred_1d.cpu() if dist_pred_1d is not None else None,
+            out_dir=vis_out_dir,
+            sample_idx=sample_idx,
+            max_points_vis=max_points if max_points is not None else 1000,
+            env_idx=idx,
+            near_thresh=near_thresh,
+        )
+
+    # 统计时间
     avg_cnn = sum(cnn_times) / len(cnn_times)
     avg_head = sum(head_times) / len(head_times)
 
     per_point_cnn = avg_cnn / (B * M_record)
     per_point_head = avg_head / (B * M_record)
 
-    log_fn("========== SINGLE SAMPLE BENCH (multi-env, cached env_feat) ==========")
-    log_fn(f"Indices                : {indices}")
-    log_fn(f"Num points per env     : {M_record} (after random sampling)")
-    log_fn(f"Avg CNN time           : {avg_cnn * 1000:.3f} ms / env")
-    log_fn(f"Avg head time          : {avg_head * 1000:.3f} ms / env")
-    log_fn(f"Avg total (CNN+head)   : {(avg_cnn + avg_head) * 1000:.3f} ms / env")
-    log_fn(f"Avg CNN per-point      : {per_point_cnn * 1e6:.3f} us / point")
-    log_fn(f"Avg head per-point     : {per_point_head * 1e6:.3f} us / point")
+    log_fn("========== [SINGLE-TASK] 单环境多关节延迟 (ispath by distance) ==========")
+    log_fn(f"Env indices             : {indices}")
+    log_fn(f"Num points per env      : {M_record} (after random sampling)")
+    log_fn(f"Avg CNN time            : {avg_cnn * 1000:.3f} ms / env")
+    log_fn(f"Avg head time           : {avg_head * 1000:.3f} ms / env")
+    log_fn(f"Avg total (CNN+head)    : {(avg_cnn + avg_head) * 1000:.3f} ms / env")
+    log_fn(f"Avg CNN per-point       : {per_point_cnn * 1e6:.3f} us / point")
+    log_fn(f"Avg head per-point      : {per_point_head * 1e6:.3f} us / point")
+    log_fn(f"[SINGLE-TASK] Visualizations saved to: {vis_out_dir}")
     log_fn("=====================================================================")
-
 
 # ================================================================
 # metrics
@@ -272,6 +355,155 @@ def visualize_sample_2d_joint(
     plt.savefig(out_path)
     plt.close(fig)
 
+def visualize_ispath_two_panel(
+    joint_states,
+    labels,
+    dist_gt,        # (N,) or None, GT distance
+    dist_pred,      # (N,) or None, predicted distance
+    out_dir,
+    sample_idx,
+    max_points_vis=1000,
+    env_idx=None,
+    near_thresh=0.5,
+):
+    """
+    适用于 label 只有 collision/free (0/1) 的情况。
+
+    左图: 使用 GT distance 判定 path_gt (dist_gt < near_thresh)
+      - collision (label=0)          : red
+      - free & 非 path_gt            : green
+      - free & path_gt (ispath)      : blue
+
+    右图: 使用模型预测的 dist_pred 判定 path_pred (dist_pred < near_thresh)
+      - collision (label=0)          : red
+      - free & 非 path_pred          : green
+      - free & path_pred (ispath)    : blue
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 转 numpy
+    joint_states = joint_states.detach().cpu().numpy()  # (N, dof)
+    labels = labels.detach().cpu().numpy().astype(np.int64)
+
+    if dist_gt is not None:
+        dist_gt = dist_gt.detach().cpu().numpy()
+    if dist_pred is not None:
+        dist_pred = dist_pred.detach().cpu().numpy()
+
+    # 去掉 ignore_index
+    valid = labels >= 0
+    joint_states = joint_states[valid]
+    labels = labels[valid]
+    if dist_gt is not None:
+        dist_gt = dist_gt[valid]
+    if dist_pred is not None:
+        dist_pred = dist_pred[valid]
+
+    N, dof = joint_states.shape
+    if dof < 2 or N == 0:
+        print(f"[Warn] sample {sample_idx}: dof={dof}, N={N}, skip vis.")
+        return
+
+    # 随机选两个关节维度
+    dim_x, dim_y = np.random.choice(dof, size=2, replace=False)
+
+    # 子采样
+    if N > max_points_vis:
+        idx = np.random.choice(N, size=max_points_vis, replace=False)
+    else:
+        idx = np.arange(N)
+
+    js = joint_states[idx]
+    lbl = labels[idx]
+    dgt = dist_gt[idx] if dist_gt is not None else None
+    dpred = dist_pred[idx] if dist_pred is not None else None
+
+    x = js[:, dim_x]
+    y = js[:, dim_y]
+
+    is_collision = (lbl == 0)
+    is_free = (lbl == 1)
+
+    if env_idx is not None:
+        title_prefix = f"[Env {env_idx}] "
+    else:
+        title_prefix = ""
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=120)
+
+    # ---------------- 左图：path_gt ----------------
+    if dgt is not None:
+        path_gt = (dgt < near_thresh) & is_free   # 只在 free 点上定义 path_gt
+    else:
+        path_gt = np.zeros_like(is_free, dtype=bool)
+
+    free_non_path_gt = is_free & (~path_gt)
+
+    colors_left = np.full_like(lbl, fill_value='lightgray', dtype=object)
+    colors_left[is_collision] = 'red'
+    colors_left[free_non_path_gt] = 'green'
+    colors_left[path_gt] = 'blue'   # path_gt 高亮
+
+    axes[0].scatter(x, y, c=colors_left, s=5, alpha=0.7)
+    axes[0].set_xlabel(f"joint {dim_x}")
+    axes[0].set_ylabel(f"joint {dim_y}")
+    axes[0].set_title(
+        f"{title_prefix}Sample {sample_idx} - path_gt\n"
+        f"(dist_gt < {near_thresh})"
+    )
+
+    import matplotlib.lines as mlines
+    legend_left = [
+        mlines.Line2D([], [], color='red', marker='o', linestyle='None',
+                      label='collision (0)', markersize=5),
+        mlines.Line2D([], [], color='green', marker='o', linestyle='None',
+                      label='free non-path_gt', markersize=5),
+        mlines.Line2D([], [], color='blue', marker='o', linestyle='None',
+                      label='path_gt (free & dist_gt<th)', markersize=5),
+    ]
+    axes[0].legend(handles=legend_left, loc='best', fontsize=8)
+
+    # ---------------- 右图：path_pred ----------------
+    if dpred is not None:
+        path_pred = (dpred < near_thresh) & is_free
+    else:
+        path_pred = np.zeros_like(is_free, dtype=bool)
+
+    free_non_path_pred = is_free & (~path_pred)
+
+    colors_right = np.full_like(lbl, fill_value='lightgray', dtype=object)
+    colors_right[is_collision] = 'red'
+    colors_right[free_non_path_pred] = 'green'
+    colors_right[path_pred] = 'blue'  # path_pred 高亮
+
+    axes[1].scatter(x, y, c=colors_right, s=5, alpha=0.7)
+    axes[1].set_xlabel(f"joint {dim_x}")
+    axes[1].set_ylabel(f"joint {dim_y}")
+    axes[1].set_title(
+        f"{title_prefix}Sample {sample_idx} - path_pred\n"
+        f"(dist_pred < {near_thresh})"
+    )
+
+    legend_right = [
+        mlines.Line2D([], [], color='red', marker='o', linestyle='None',
+                      label='collision (0)', markersize=5),
+        mlines.Line2D([], [], color='green', marker='o', linestyle='None',
+                      label='free non-path_pred', markersize=5),
+        mlines.Line2D([], [], color='blue', marker='o', linestyle='None',
+                      label='path_pred (free & dist_pred<th)', markersize=5),
+    ]
+    axes[1].legend(handles=legend_right, loc='best', fontsize=8)
+
+    plt.tight_layout()
+
+    if env_idx is not None:
+        out_name = f"single_ispath_{sample_idx:04d}_env_{env_idx:04d}.png"
+    else:
+        out_name = f"single_ispath_{sample_idx:04d}.png"
+
+    out_path = os.path.join(out_dir, out_name)
+    plt.savefig(out_path)
+    plt.close(fig)
 
 # ================================================================
 # main eval
@@ -302,6 +534,7 @@ def main(args):
     log_string(str(args))
     log_string(f"Experiment dir: {experiment_dir}")
     log_string(f"Checkpoint: {args.ckpt_path}")
+    log_string(f"Eval mode: {args.eval_mode}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -390,20 +623,36 @@ def main(args):
     model.load_state_dict(ckpt["model_state_dict"])
     log_string(f"Loaded checkpoint from epoch {ckpt.get('epoch', 'N/A')}")
 
-    # -------------------------
-    # 单个环境延迟 benchmark（随机环境 + 随机关节）
-    # -------------------------
-    log_string("Running single-sample latency benchmark on random env & joints (cached env_feat) ...")
-    benchmark_single_sample(
-        model,
-        test_dataset,
-        device,
-        log_fn=log_string,
-        warmup=10,
-        num_run=50,
-        num_env=5,
-        max_points=2000   # 随机抽 2000 个关节角度
-    )
+    # ======================================================
+    # 【单任务】单个环境延迟 benchmark（随机环境 + 随机关节）
+    # ======================================================
+    if args.eval_mode in ["single", "both"]:
+        log_string("========== [SINGLE-TASK] 开始单环境延迟 benchmark (ispath by distance) ==========")
+        single_vis_dir = os.path.join(
+            experiment_dir, "figures", "single_task_ispath"
+        )
+        benchmark_single_sample(
+            model,
+            test_dataset,
+            device,
+            log_fn=log_string,
+            warmup=10,
+            num_run=50,
+            num_env=1,
+            max_points=2000,
+            near_thresh=args.near_thresh,   # argparse 里要有这个参数
+            vis_out_dir=single_vis_dir,
+        )
+
+
+    # 如果只想跑单任务，后面多任务评估直接跳过
+    if args.eval_mode == "single":
+        log_string("[INFO] eval_mode=single，只运行单任务 benchmark，不执行多任务全测试集评估。")
+        return
+
+    # ======================================================
+    # 【多任务】全 test 集评估 + 混淆矩阵 + 推理时间统计
+    # ======================================================
 
     # Loss (可选，如果想看 test loss) —— 和 train.py 对齐
     class_weights = torch.tensor([1.5, 1.0, 2.0], device=device)
@@ -437,6 +686,9 @@ def main(args):
     )
 
     env_cursor = 0
+
+    log_string("========== [MULTI-TASK] 开始全 test 集批量评估 ==========")
+
     with torch.no_grad():
         for env_voxel, joint_states, labels, meta in tqdm(
             test_loader, desc="[Test]"
@@ -598,7 +850,7 @@ def main(args):
 
         avg_total_point = (total_cnn_time + total_head_time) / total_points
 
-        log_string("========== INFERENCE SPEED (split CNN/head) ==========")
+        log_string("========== [MULTI-TASK] INFERENCE SPEED (split CNN/head) ==========")
         log_string(f"Avg CNN time per env   : {avg_cnn_env * 1000:.3f} ms/env")
         log_string(f"Avg head time per env  : {avg_head_env * 1000:.3f} ms/env")
         log_string(f"Avg total time per env : {avg_total_env * 1000:.3f} ms/env")

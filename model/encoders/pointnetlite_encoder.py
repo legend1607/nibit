@@ -73,12 +73,15 @@ class PointNetLiteEncoder(nn.Module):
                 return global_feat, local_feat
             return global_feat
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # ----------------------------------------------------------------------
 # AttentionPointNet：用于替换 JointPointNetEncoder 里的 PointNetLiteEncoder
 #   - per-point MLP 提升维度
 #   - Self-Attention 沿 N 维建模点与点之间的关系
-#   - Attention Pooling 获取可学习的 global feature
+#   - (可选) Attention Pooling / Max Pooling 获取 global feature
 # ----------------------------------------------------------------------
 class AttentionPointNet(nn.Module):
     """
@@ -96,18 +99,18 @@ class AttentionPointNet(nn.Module):
         attn_dropout: float = 0.1,   # Transformer 内部的 dropout
         ff_multiplier: float = 2.0,
         use_attn_pool: bool = True,
-        mlp_dropout: float = 0.1,    # 🔥 新增：per-point MLP dropout
-        feat_dropout: float = 0.1    # 🔥 新增：self-attn 之后的 dropout
+        mlp_dropout: float = 0.1,    # per-point MLP dropout
+        feat_dropout: float = 0.1    # self-attn 之后的 dropout
     ):
         super().__init__()
+        self.use_attn_pool = use_attn_pool
 
         # 1) per-point MLP: (B, N, in_dim) -> (B, N, embed_dim)
         mlp_layers = []
         dims = [in_dim] + list(hidden_dims) + [embed_dim]
         for i in range(len(dims) - 1):
             mlp_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            # 最后一层不加激活和 dropout
-            if i != len(dims) - 2:
+            if i != len(dims) - 2:  # 最后一层不加激活和 dropout
                 mlp_layers.append(nn.ReLU(inplace=True))
                 if mlp_dropout > 0:
                     mlp_layers.append(nn.Dropout(mlp_dropout))
@@ -118,7 +121,7 @@ class AttentionPointNet(nn.Module):
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=int(embed_dim * ff_multiplier),
-            dropout=attn_dropout,      # attention + FFN 里面自带 dropout
+            dropout=attn_dropout,
             batch_first=True,
             activation="relu",
             norm_first=True
@@ -128,26 +131,13 @@ class AttentionPointNet(nn.Module):
             num_layers=num_layers
         )
 
-        # self-attn 之后再丢一点特征，防止过拟合太严重
-        if feat_dropout > 0:
-            self.feat_dropout = nn.Dropout(feat_dropout)
-        else:
-            self.feat_dropout = nn.Identity()
+        # self-attn 之后再丢一点特征
+        self.feat_dropout = nn.Dropout(feat_dropout) if feat_dropout > 0 else nn.Identity()
 
-        self.use_attn_pool = use_attn_pool
-
-        # 3) Attention Pooling：学习每个点对全局特征的贡献
+        # 3) Pooling head：attention pooling（可学习） or max pooling（PointNet风格）
         if self.use_attn_pool:
-            self.attn_pool = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 2),
-                nn.ReLU(inplace=True),
-                # 这里一般不需要太大 dropout，先不加也可以
-                # 如果后面还明显过拟合，可以在这里再加一个 Dropout
-                # nn.Dropout(0.1),
-                nn.Linear(embed_dim // 2, 1)
-            )
-        else:
-            self.attn_pool = None
+            # 每个点 -> 一个标量 score；softmax 后做加权求和
+            self.pool_score = nn.Linear(embed_dim, 1, bias=True)
 
     def forward(self, x: torch.Tensor):
         """
@@ -159,18 +149,20 @@ class AttentionPointNet(nn.Module):
         # per-point MLP
         feat = self.mlp(x)               # (B, N, embed_dim)
 
-        # self-attention：显式建模点与点之间的依赖
+        # self-attention
         feat = self.self_attn(feat)      # (B, N, embed_dim)
-        feat = self.feat_dropout(feat)   # 🔥 self-attn 后再丢一点
+        feat = self.feat_dropout(feat)   # (B, N, embed_dim)
         local_feat = feat
 
-        # 全局特征
-        if self.attn_pool is not None:
-            # (B, N, E) -> (B, N, 1)
-            weights = self.attn_pool(local_feat)
-            weights = torch.softmax(weights, dim=1)               # 对 N 维做 softmax
-            global_feat = torch.sum(local_feat * weights, dim=1)  # (B, E)
+        # global pooling
+        if self.use_attn_pool:
+            # scores: (B, N, 1) -> weights: (B, N, 1)
+            scores = self.pool_score(local_feat)
+            weights = torch.softmax(scores, dim=1)
+            # weighted sum over N -> (B, embed_dim)
+            global_feat = torch.sum(weights * local_feat, dim=1)
         else:
-            global_feat = torch.amax(local_feat, dim=1)           # fallback: max pooling
+            # maxpool over N -> (B, embed_dim)
+            global_feat = torch.max(local_feat, dim=1)[0]
 
         return global_feat, local_feat

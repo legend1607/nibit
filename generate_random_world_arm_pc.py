@@ -15,7 +15,7 @@ npoints = 2000                           # 每个样本最终采样的关节状�
 voxel_resolution = np.array([50, 50, 50], dtype=int)  # 体素分辨率 (X, Y, Z)
 
 # 路径邻近判定阈值（归一化后空间）
-PATH_DIST_THRESH = 0.08
+PATH_DIST_THRESH = 0.2
 
 # 过采样倍数
 OVERSAMPLE_FACTOR = 3   # 实际采 M = npoints * OVERSAMPLE_FACTOR
@@ -64,41 +64,39 @@ def voxelize_env(env_range, obstacles, resolution):
 # ============================
 # 新：考虑关节范围归一化的路径邻近判定
 # ============================
-def points_to_path_is_near(points, path, pose_range, thresh=PATH_DIST_THRESH):
+def points_to_polyline_is_near(points, path, pose_range, thresh=PATH_DIST_THRESH):
     points = np.asarray(points, dtype=np.float32)
     path   = np.asarray(path, dtype=np.float32)
     pose_range = np.asarray(pose_range, dtype=np.float32)
-    
+
     low  = pose_range[:, 0]
     high = pose_range[:, 1]
     span = high - low
-    span[span == 0] = 1e-6  # 防止除零
+    span[span == 0] = 1e-6
 
-    points_norm = (points - low) / span
-    path_norm   = (path - low) / span
+    P = (points - low) / span                  # (N, D)
+    X = (path   - low) / span                  # (T, D)
 
-    N, D = points_norm.shape
-    T, _ = path_norm.shape
+    if X.shape[0] < 2:
+        # path 只有 1 个点时退化成 point-to-point
+        d = np.linalg.norm(P - X[None, 0, :], axis=-1)
+        return (d <= thresh).astype(np.int8), d
 
-    if T < 2:
-        diff = points_norm - path_norm[0]
-        distances = np.linalg.norm(diff, axis=1)
-    else:
-        p0 = path_norm[:-1]
-        p1 = path_norm[1:]
-        seg = p1 - p0
+    A = X[:-1]                                 # (S, D)
+    B = X[1:]                                  # (S, D)
+    AB = B - A                                 # (S, D)
+    denom = np.sum(AB * AB, axis=-1) + 1e-12   # (S,)
 
-        v = points_norm[:, None, :] - p0[None, :, :]
-        seg_len2 = np.sum(seg * seg, axis=1)
-        seg_len2 = np.where(seg_len2 < 1e-9, 1e-9, seg_len2)
-        t = np.sum(v * seg[None, :, :], axis=2) / seg_len2[None, :]
-        t = np.clip(t, 0.0, 1.0)
-        proj = p0[None, :, :] + seg[None, :, :] * t[:, :, None]
-        d2 = np.sum((proj - points_norm[:, None, :]) ** 2, axis=2)
-        distances = np.sqrt(np.min(d2, axis=1))
+    PA = P[:, None, :] - A[None, :, :]         # (N, S, D)
+    t = np.sum(PA * AB[None, :, :], axis=-1) / denom[None, :]  # (N, S)
+    t = np.clip(t, 0.0, 1.0)
 
-    is_path = distances < thresh
-    return is_path.astype(np.uint8), distances
+    proj = A[None, :, :] + t[:, :, None] * AB[None, :, :]      # (N, S, D)
+    dists = np.linalg.norm(P[:, None, :] - proj, axis=-1)       # (N, S)
+
+    min_d = dists.min(axis=1)                   # (N,)
+    is_near = (min_d <= thresh).astype(np.int8)
+    return is_near, min_d
 
 # ============================
 # 单个 split 处理函数
@@ -113,7 +111,7 @@ def process_split(split_name):
     with open(json_path, "r") as f:
         env_list = json.load(f)
 
-    voxel_list, pc_list, starts_list, goals_list, labels_list = [], [], [], [], []
+    voxel_list, pc_list, starts_list, goals_list, labels_list, pathlabels_list = [], [], [], [], [], []
     paths_list, env_ranges_list, pose_ranges_list, obstacles_list = [], [], [], []
 
     sample_count = 0
@@ -145,11 +143,6 @@ def process_split(split_name):
             elif typ == "sphere":
                 r = float(size[0])
                 env_sim.add_sphere_obstacle(r, pos)
-#         print("JSON pose_range low:", low)
-#         print("JSON pose_range high:", high)
-
-#         print("env_sim.pose_range low:", env_sim.pose_range[:, 0])
-#         print("env_sim.pose_range high:", env_sim.pose_range[:, 1])
 
         num_paths = len(paths)
         for i in range(num_paths):
@@ -178,12 +171,10 @@ def process_split(split_name):
                 total_len = 0.0
 
             # === 核心：根据路径长度 + 点数决定 near-path 采样数 ===
-            # 可以调这两个超参数
-            SAMPLES_PER_UNIT_LEN   = 800   # 每单位归一化路径长度分配多少 near-path 点
-            SAMPLES_PER_WAYPOINT   = 5     # 每个路径点额外分配多少 near-path 点
+            SAMPLES_PER_UNIT_LEN   = 800
+            SAMPLES_PER_WAYPOINT   = 5
 
             M_path_raw = SAMPLES_PER_UNIT_LEN * total_len + SAMPLES_PER_WAYPOINT * T
-            # 裁剪到 [0, M]，保证不会超过总采样量
             M_path_eff = int(np.clip(M_path_raw, 0, M))
             M_uniform  = M - M_path_eff
 
@@ -194,14 +185,13 @@ def process_split(split_name):
             # 2) 按“线段长度”采样路径附近（总共 M_path_eff 个点）
             if M_path_eff > 0:
                 if T < 2:
-                    # 只有一个路径点：围绕这个点打 M_path_eff 个“球”
                     center = path_norm[0]
                     for _ in range(M_path_eff):
                         dir_noise = np.random.normal(size=D).astype(np.float32)
                         norm = np.linalg.norm(dir_noise) + 1e-9
                         dir_noise = dir_noise / norm
 
-                        r = PATH_DIST_THRESH * np.random.rand()  # [0, PATH_DIST_THRESH]
+                        r = PATH_DIST_THRESH * np.random.rand()
                         noise_norm = dir_noise * r
 
                         q_norm = center + noise_norm
@@ -212,18 +202,17 @@ def process_split(split_name):
                         states_raw_big.append(q)
 
                 else:
-                    # 有多于 1 个点：根据“线段长度”分配 M_path_eff 个样本
                     seg_lens_safe = seg_lens + 1e-9
                     total_len_safe = float(np.sum(seg_lens_safe))
 
-                    raw_counts = M_path_eff * seg_lens_safe / total_len_safe  # (T-1,)
+                    raw_counts = M_path_eff * seg_lens_safe / total_len_safe
                     samples_per_seg = np.floor(raw_counts).astype(int)
                     assigned = int(np.sum(samples_per_seg))
                     remaining = M_path_eff - assigned
 
                     if remaining > 0:
                         frac = raw_counts - samples_per_seg
-                        order = np.argsort(-frac)   # 按小数部分降序
+                        order = np.argsort(-frac)
                         for k in range(remaining):
                             samples_per_seg[order[k]] += 1
 
@@ -237,27 +226,23 @@ def process_split(split_name):
                         p1 = path_norm[seg_id + 1]
 
                         for _ in range(num_samples_seg):
-                            # 在线段 [p0, p1] 上随机插值
                             t = np.random.rand()
                             base_norm = (1.0 - t) * p0 + t * p1
 
-                            # 在归一化空间里生成一个半径 <= PATH_DIST_THRESH 的随机扰动
                             dir_noise = np.random.normal(size=D).astype(np.float32)
                             norm = np.linalg.norm(dir_noise) + 1e-9
                             dir_noise = dir_noise / norm
 
-                            r = PATH_DIST_THRESH * np.random.rand()  # [0, PATH_DIST_THRESH]
+                            r = PATH_DIST_THRESH * np.random.rand()
                             noise_norm = dir_noise * r
 
                             q_norm = base_norm + noise_norm
                             q_norm = np.clip(q_norm, 0.0, 1.0)
 
-                            # 映射回原关节空间
                             q = low + q_norm * span
                             q = np.clip(q, low, high)
                             states_raw_big.append(q)
 
-            # 最终检查：长度 ≈ M（防止整型舍入带来的 ±1 误差）
             states_raw_big = np.array(states_raw_big, dtype=np.float32)
             if len(states_raw_big) != M:
                 if len(states_raw_big) > M:
@@ -268,14 +253,13 @@ def process_split(split_name):
                     extra_samples = np.array([env_sim.uniform_sample() for _ in range(extra)], dtype=np.float32)
                     states_raw_big = np.concatenate([states_raw_big, extra_samples], axis=0)
 
-
-
-
             free_mask_big = np.array([env_sim._state_fp(q) for q in states_raw_big], dtype=bool)
             is_collision_big = (~free_mask_big).astype(np.uint8)
 
             # -------- 使用归一化后的路径邻近判定 --------
-            is_path_big, distances_big = points_to_path_is_near(states_raw_big, path_raw, pose_range, PATH_DIST_THRESH)
+            is_path_big, distances_big = points_to_polyline_is_near(
+                states_raw_big, path_raw, pose_range, PATH_DIST_THRESH
+            )
 
             # -------- 权重抽样 --------
             weights = np.ones(M, dtype=np.float32) * W_FREE
@@ -288,7 +272,7 @@ def process_split(split_name):
             else:
                 final_idx = np.random.choice(M, size=npoints, replace=True, p=prob)
 
-            states_raw  = states_raw_big[final_idx]
+            states_raw   = states_raw_big[final_idx]
             is_collision = is_collision_big[final_idx]
             is_path      = is_path_big[final_idx]
             distances    = distances_big[final_idx]
@@ -296,10 +280,24 @@ def process_split(split_name):
             total_is_path += int(np.sum(is_path))
             total_paths   += 1
 
-            label = np.ones(npoints, dtype=np.int8)
-            label[is_path == 1] = 2
-            label[is_collision == 1] = 0
+            # =========================================================
+            # ✅ labels 改为 free/collision 二分类
+            #    0 = collision, 1 = free
+            # =========================================================
+            label = np.ones(npoints, dtype=np.int8)     # 默认 free=1
+            label[is_collision == 1] = 0               # collision=0
             total_free += int(np.sum(label == 1))
+
+            # =========================================================
+            # ✅ 新增 pathlabel 软标签
+            #    PATH_DIST_THRESH 内: distance 越小 soft 越大
+            #    线性衰减: 1 - d/thresh, 之外为 0
+            #    碰撞点强制为 0
+            # =========================================================
+            pathlabel = np.clip(
+                1.0 - distances / PATH_DIST_THRESH, 0.0, 1.0
+            ).astype(np.float32)
+            pathlabel[is_collision == 1] = 0.0
 
             pc_norm    = (states_raw - low) / span
             start_norm = (start_raw  - low) / span
@@ -311,6 +309,7 @@ def process_split(split_name):
             starts_list.append(start_norm)
             goals_list.append(goal_norm)
             labels_list.append(label)
+            pathlabels_list.append(pathlabel)   # ✅ 记得 append
 
             paths_list.append(path_norm)
             env_ranges_list.append(env_range)
@@ -330,17 +329,18 @@ def process_split(split_name):
     starts      = np.stack(starts_list, axis=0)
     goals       = np.stack(goals_list, axis=0)
     labels      = np.stack(labels_list, axis=0)
+    pathlabels  = np.stack(pathlabels_list, axis=0)
     env_ranges  = np.stack(env_ranges_list, axis=0)
     pose_ranges = np.stack(pose_ranges_list, axis=0)
     paths_arr     = np.array(paths_list, dtype=object)
     obstacles_arr = np.array(obstacles_list, dtype=object)
 
-    print(f"voxel_grids: {voxel_grids.shape}, pc: {pc.shape}, labels: {labels.shape}")
+    print(f"voxel_grids: {voxel_grids.shape}, pc: {pc.shape}, labels: {labels.shape}, pathlabels: {pathlabels.shape}")
 
     avg_is_path = total_is_path / total_paths if total_paths > 0 else 0
     ratio_ispath_free = total_is_path / total_free if total_free > 0 else 0.0
-    print(f"📊 平均每条路径附近点数: {avg_is_path:.2f} / {npoints}")
-    print(f"📈 is_path 占 free-space 比例: {ratio_ispath_free:.4f}")
+    print(f"📊 平均每条路径附近点数(hard): {avg_is_path:.2f} / {npoints}")
+    print(f"📈 is_path(hard) 占 free-space 比例: {ratio_ispath_free:.4f}")
 
     np.savez_compressed(
         out_path,
@@ -349,6 +349,7 @@ def process_split(split_name):
         starts=starts,
         goals=goals,
         labels=labels,
+        pathlabels=pathlabels,
         env_ranges=env_ranges,
         pose_ranges=pose_ranges,
         paths=paths_arr,

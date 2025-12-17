@@ -11,7 +11,7 @@ class JointMLPEncoder(nn.Module):
     """
     def __init__(
         self,
-        joint_in_dim=7,         # 关节维度（比如 7 自由度）
+        joint_in_dim=4,         # 关节维度
         joint_feat_dim=64,      # 输出 F_joint
         hidden_dims=[128, 128], # 中间隐层
         dropout=0.1

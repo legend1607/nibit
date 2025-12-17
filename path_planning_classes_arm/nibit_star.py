@@ -174,6 +174,15 @@ class NIBITStar:
         self.n_collision_points = 0
         self.n_free_points = 2
         self.path = []
+        # ========= 自适应 near-path 距离阈值 =========
+        self.tau_init = 1.0      # 初始“近路径”距离阈值（按你的距离尺度调）
+        self.tau_min  = 0.05     # 最小阈值（越小越精细）
+        self.tau_shrink = 0.98   # 每次迭代默认收缩比例
+        self.tau_shrink_fast = 0.90  # 找到解后更快收缩
+
+        self.tau = self.tau_init
+        self.has_solution = False
+        self.free_th = 0.6   # 判定为 free 的概率阈值，0.5~0.8 可调
 
     # ---------- helper: convert any point-like to hashable tuple ----------
     def to_key(self, point, ndigits=6):
@@ -273,69 +282,85 @@ class NIBITStar:
         """
         使用 informed sampling（椭圆 + 全局）产生候选关节点，
         不做碰撞检测，统一交给神经网络打分：
-        - 优先选择预测为 label=2 的“路径点”
-        - 不够再从 label=1 的“自由点”中补齐
+        - 使用 P(path) 做 Top-K 选点
         """
 
         def select_with_nn(candidates):
-            """
-            candidates: List[np.ndarray] 或 (N, dof) 的 array
-            返回：List[tuple]，长度 <= batch_size
-            """
             if len(candidates) == 0:
                 return []
 
             joints_np = np.array(candidates, dtype=float)
 
-            # 如果没有神经网络，就纯随机选
+            # 没网络：随机
             if self.neural_wrapper is None:
                 if len(joints_np) > batch_size:
                     idx = np.random.choice(len(joints_np), size=batch_size, replace=False)
                     joints_np = joints_np[idx]
                 return [self.to_key(p) for p in joints_np]
 
-            # 用预测网络拿 label=2 / label=1
-            mask_path, probs = self.neural_wrapper.get_path_mask(
-                joints_np, cls=2, prob_th=None
-            )
-            pred = np.argmax(probs, axis=-1)
-            visualize_nn_predictions(joints_np,pred)
-            path_pts = joints_np[mask_path]
-            free_pts = joints_np[(pred == 1) & (~mask_path)]
-            other_pts = joints_np[(pred != 2) & (pred != 1)]
+            # ===== 1) 预测 collision/free logits 和 距离 =====
+            logits = self.neural_wrapper.predict_logits(joints_np)   # (N,2)
+            dist_pred = self.neural_wrapper.predict_dist(joints_np)  # (N,)
 
-            # ① 先取 path 点
-            if len(path_pts) >= batch_size:
-                idx = np.random.choice(len(path_pts), size=batch_size, replace=False)
-                selected = path_pts[idx]
+            logits = np.asarray(logits, dtype=float)
+            dist_pred = np.asarray(dist_pred, dtype=float).reshape(-1)
+
+            # ===== 2) softmax 得到 free 概率 =====
+            # 避免数值溢出，减掉最大值
+            logits_max = np.max(logits, axis=-1, keepdims=True)
+            exp = np.exp(logits - logits_max)
+            probs = exp / np.sum(exp, axis=-1, keepdims=True)  # (N,2)
+            p_free = probs[:, 1]  # 假设 class 1 = free
+
+            free_mask = p_free >= self.free_th
+
+            # 如果太严格导致一个 free 都没有，退回不做 free 过滤
+            if not np.any(free_mask):
+                free_mask = np.ones_like(free_mask, dtype=bool)
+
+            # ===== 3) “近路径 & free” 的点：dist < tau 且 free =====
+            near_mask = (dist_pred < self.tau) & free_mask
+            near_pts = joints_np[near_mask]
+            near_dist = dist_pred[near_mask]
+
+            K = min(batch_size, len(joints_np))
+            selected = []
+
+            if len(near_pts) >= K:
+                # 只在 near free 里按距离从小到大取 K 个
+                order = np.argsort(near_dist)[:K]
+                selected = near_pts[order]
             else:
-                if len(path_pts) > 0:
-                    selected = path_pts.copy()
-                else:
-                    selected = np.empty((0, joints_np.shape[1]), dtype=float)
+                # 先把所有 near free 点放进去
+                selected = list(near_pts)
+                remain = K - len(selected)
 
-                # ② 再从 free 点补
-                remain = batch_size - len(selected)
-                if remain > 0 and len(free_pts) > 0:
-                    if len(free_pts) > remain:
-                        idx = np.random.choice(len(free_pts), size=remain, replace=False)
-                        selected = np.vstack([selected, free_pts[idx]])
-                    else:
-                        selected = np.vstack([selected, free_pts])
+                # ===== 4) 用“全体 free 点中的最小距离”补齐 =====
+                # 先只在 free 里按距离排序
+                free_idx = np.where(free_mask)[0]
+                free_sorted = free_idx[np.argsort(dist_pred[free_idx])]
 
-                # ③ 还不够就从其他点里补
-                remain = batch_size - len(selected)
-                if remain > 0 and len(other_pts) > 0:
-                    if len(other_pts) > remain:
-                        idx = np.random.choice(len(other_pts), size=remain, replace=False)
-                        selected = np.vstack([selected, other_pts[idx]])
-                    else:
-                        selected = np.vstack([selected, other_pts])
+                for idx in free_sorted:
+                    if len(selected) >= K:
+                        break
+                    if not near_mask[idx]:   # 避免与 near 重复
+                        selected.append(joints_np[idx])
 
-            return [self.to_key(p) for p in selected[:batch_size]]
+                # 仍然不够（极端情况：free 非常少），退化到全体里补
+                if len(selected) < K:
+                    order_all = np.argsort(dist_pred)
+                    for idx in order_all:
+                        if len(selected) >= K:
+                            break
+                        if joints_np[idx] not in selected:
+                            selected.append(joints_np[idx])
+
+                selected = np.array(selected, dtype=float)
+
+            return [self.to_key(p) for p in selected]
 
         # ------------------------------------------------
-        # 主体逻辑
+        # 后面的主体逻辑不变
         # ------------------------------------------------
         candidates = []
         oversample_factor = 10
@@ -786,6 +811,14 @@ class NIBITStar:
                 no_improve_count = 0
             else:
                 no_improve_count += 1
+            # ---- 更新自适应阈值 tau ----
+            if (not self.has_solution) and np.isfinite(g_goal):
+                # 第一次找到可行解
+                self.has_solution = True
+                self.tau = max(self.tau_min, self.tau * self.tau_shrink_fast)
+            else:
+                # 常规逐步收缩
+                self.tau = max(self.tau_min, self.tau * self.tau_shrink)
 
             # 判定 1：找到直接连接的最优路径
             if (
