@@ -57,208 +57,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# 假定你已经有：
-# from your_module import JointPointNetEncoder, voxelize_env
-
-class NeuralWrapper:
-    def __init__(self, problem, ckpt_path, voxel_resolution=(50, 50, 50), device="cuda"):
-        """
-        problem: 包含 env_dict / start 等信息的数据结构
-        ckpt_path: 训练好的 JointPointNetEncoder 的 checkpoint 路径
-        """
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        env_record = problem["env_dict"]
-
-        # ------------------------------
-        # 关节维度
-        # ------------------------------
-        start = np.array(problem["start"], dtype=np.float32)
-        self.dof = start.shape[0]
-
-        # ------------------------------
-        # 保存 pose_range / low / span，用于归一化
-        # ------------------------------
-        pose_range = np.array(env_record["pose_range"], dtype=np.float32)  # (dof, 2)
-        self.low  = pose_range[:, 0]
-        self.high = pose_range[:, 1]
-        self.span = self.high - self.low
-        self.span[self.span == 0] = 1e-6  # 防止除 0
-
-        # ------------------------------
-        # 构建环境体素
-        # ------------------------------
-        env_range = np.array(env_record["env_range"], dtype=np.float32)
-        obstacles = env_record["obstacles"]
-
-        voxel = voxelize_env(env_range, obstacles, np.array(voxel_resolution, dtype=int))
-        voxel = voxel.astype(np.float32)
-        voxel = torch.from_numpy(voxel).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,D,H,W)
-        self.env_voxel = voxel
-
-        # ------------------------------
-        # 创建并加载 JointPointNetEncoder
-        # ------------------------------
-        self.model = JointPointNetEncoder(
-            joint_in_dim=self.dof,
-            joint_feat_dim=48,
-            env_latent_dim=60,
-            pointnet_embed_dim=256,
-            num_classes=2      # 0=collision, 1=free
-        ).to(self.device)
-
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        self.model.load_state_dict(state_dict)
-        self.model.eval()
-
-        # ------------------------------
-        # 预先 encode 环境特征，重复使用
-        # ------------------------------
-        with torch.no_grad():
-            self.env_feat = self.model.encode_env(self.env_voxel)  # (1, env_latent_dim)
-
-    # ==========================================================
-    # 关节归一化：映射到 [0,1]
-    # ==========================================================
-    @torch.no_grad()
-    def _normalize_joints(self, joints_np: np.ndarray) -> np.ndarray:
-        """
-        joints_np: (N, dof) or (dof,)
-        return:    (N, dof)，归一化到 [0,1]
-        """
-        q = np.asarray(joints_np, dtype=np.float32)
-        if q.ndim == 1:
-            q = q[None, :]
-        q_norm = (q - self.low) / self.span
-        q_norm = np.clip(q_norm, 0.0, 1.0)
-        return q_norm
-
-    # ==========================================================
-    # 内部共用：一次 forward 同时拿 logits & pathlogits
-    # ==========================================================
-    @torch.no_grad()
-    def _forward_batch(self, joints_np: np.ndarray):
-        """
-        joints_np: (N, dof) or (dof,)
-        return:
-          logits:     (N, 2)
-          pathlogits: (N,)
-        """
-        q_norm = self._normalize_joints(joints_np)  # (N, dof)
-        joints_t = torch.from_numpy(q_norm).float().unsqueeze(0).to(self.device)  # (1, N, dof)
-
-        logits, pathlogits, _, _ = self.model.forward_with_env_feat(self.env_feat, joints_t)
-        # 去掉 batch 维
-        logits = logits[0]         # (N, 2)
-        pathlogits = pathlogits[0] # (N,)
-
-        return logits, pathlogits
-
-    # ==========================================================
-    # 只要 free/collision 的 logits
-    # ==========================================================
-    @torch.no_grad()
-    def predict_logits(self, joints_np: np.ndarray) -> np.ndarray:
-        """
-        joints_np: (N, dof) or (dof,)
-        return:    logits (N, 2), class 0=collision, 1=free
-        """
-        logits, _ = self._forward_batch(joints_np)
-        return logits.cpu().numpy()
-
-    # ==========================================================
-    # 只要 path head 的 logits
-    # ==========================================================
-    @torch.no_grad()
-    def predict_pathlogits(self, joints_np: np.ndarray) -> np.ndarray:
-        """
-        joints_np: (N, dof) or (dof,)
-        return:    pathlogits (N,)
-        """
-        _, pathlogits = self._forward_batch(joints_np)
-        return pathlogits.cpu().numpy()
-
-    # ==========================================================
-    # free / collision 判定
-    # ==========================================================
-    @torch.no_grad()
-    def get_free_mask(self, joints_np, prob_th: float = None):
-        """
-        根据分类 head 判定 free / collision.
-
-        joints_np: (N, dof) or (dof,)
-        prob_th:
-            - None: 用 argmax 判定
-            - 非 None: 用 P(free) >= prob_th 判定
-
-        返回:
-          free_mask: (N,) bool
-          probs:     (N,2) np.float32，softmax 概率
-                     probs[:,0] = P(collision)
-                     probs[:,1] = P(free)
-        """
-        logits = self.predict_logits(joints_np)            # (N, 2)
-        logits_t = torch.from_numpy(logits)
-        probs = torch.softmax(logits_t, dim=-1)            # (N, 2)
-
-        p_free = probs[:, 1]
-
-        if prob_th is None:
-            pred = torch.argmax(probs, dim=-1)
-            free_mask = (pred == 1)                        # class 1 = free
-        else:
-            free_mask = (p_free >= prob_th)
-
-        return free_mask.cpu().numpy().astype(bool), probs.cpu().numpy()
-
-    # ==========================================================
-    # path 判定（只看 path head）
-    # ==========================================================
-    @torch.no_grad()
-    def get_path_mask(self, joints_np, prob_th: float = 0.5):
-        """
-        根据 path head 的 sigmoid 概率判定 path 点.
-
-        joints_np: (N, dof) or (dof,)
-        prob_th:   阈值，默认 0.5
-
-        返回:
-          path_mask: (N,) bool
-          probs:     (N,) np.float32，path 概率 ∈ [0,1]
-        """
-        pathlogits = self.predict_pathlogits(joints_np)        # (N,)
-        pathlogits_t = torch.from_numpy(pathlogits)
-        probs = torch.sigmoid(pathlogits_t)                    # (N,)
-
-        mask = (probs >= prob_th)
-
-        return mask.cpu().numpy().astype(bool), probs.cpu().numpy()
-
-    # ==========================================================
-    # “安全路径点”：free ∧ path
-    # ==========================================================
-    @torch.no_grad()
-    def get_safe_path_mask(self, joints_np, free_th: float = None, path_th: float = 0.5):
-        """
-        返回：同时满足
-          - 分类 head 认为是 free
-          - path head 概率 >= path_th
-        的点。
-
-        joints_np: (N, dof) or (dof,)
-        free_th:   P(free) 的阈值（None 表示用 argmax）
-        path_th:   path 概率阈值
-
-        返回:
-          safe_mask: (N,) bool
-          path_probs: (N,) np.float32（path head 概率）
-        """
-        free_mask, _ = self.get_free_mask(joints_np, prob_th=free_th)
-        path_mask, path_probs = self.get_path_mask(joints_np, prob_th=path_th)
-
-        safe_mask = free_mask & path_mask
-        return safe_mask, path_probs
-
 # ============================================================
 # 1. 读取 envs.json（由 generate_random_world_arm parallel.py 生成）
 # ============================================================
@@ -358,7 +156,7 @@ def get_problem_input(
     start = tuple(starts[traj_index])
     goal = tuple(goals[traj_index])
 
-    env = rebuild_env_from_record(env_record, gui=True)
+    env = rebuild_env_from_record(env_record, gui=gui)
 
     problem = {
         "start": start,
@@ -420,7 +218,7 @@ def parse_args():
     parser.add_argument(
         "--env_idx",
         type=int,
-        default=112,
+        default=5,
         help="使用第几个环境（0-based），默认随机选择",
     )
     parser.add_argument(
@@ -492,11 +290,12 @@ def main():
         path_planner = get_bit_planner(args, problem, neural_wrapper)
 
     elif args.path_planner == "NIBITStar":
-        from path_planning_classes_arm.nibit_star import get_bit_planner
+        from path_planning_classes_arm.nibit_star_fixed import get_bit_planner
+        from neural_wrapper import NeuralWrapper
         # 创建 NeuralWrapper：自动构建体素、加载模型、算 env_feat
         neural_wrapper = NeuralWrapper(
             problem=problem,
-            ckpt_path="results/model_training/liche_pointnet/checkpoints/best_model.pt",
+            ckpt_path="results/model_training/train_20251215-144528/best.pt",
             voxel_resolution=(50,50,50),
             device="cuda"
         )

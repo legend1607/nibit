@@ -14,12 +14,11 @@ import matplotlib.pyplot as plt
 from demo_planning_arm import (
     get_env_configs,
     get_problem_input,
-    NeuralWrapper,
 )
-
+from neural_wrapper import NeuralWrapper
 from path_planning_classes_arm.bit_star import get_bit_planner as get_bit_planner_bit
-from path_planning_classes_arm.nibit_star import get_bit_planner as get_bit_planner_nibit
-from path_planning_classes_arm.irrt_star import get_irrt_planner as get_irrt_planner_irrt
+from path_planning_classes_arm.nibit_star_fixed import get_bit_planner as get_bit_planner_nibit
+from path_planning_classes_arm.irrtstar import get_irrtstar_planner,get_nirrtstar_planner
 
 
 # ---------------------------
@@ -46,7 +45,10 @@ def build_planner(planner_name, args, problem, nw_cache):
         return get_bit_planner_nibit(args, problem, neural_wrapper=nw_cache["NIBITSTAR"])
     elif name == "IRRTSTAR":
         # IRRT* 不需要 NeuralWrapper，直接构造
-        return get_irrt_planner_irrt(args, problem, neural_wrapper=None)
+        return get_irrtstar_planner(args, problem, neural_wrapper=None)
+    elif name == "NIRRTSTAR":
+        # IRRT* 不需要 NeuralWrapper，直接构造
+        return get_nirrtstar_planner(args, problem, neural_wrapper=None)
 
     else:
         raise ValueError(f"未知的 planner: {planner_name}")
@@ -695,7 +697,7 @@ def parse_args():
     parser.add_argument(
         "--num_tasks",
         type=int,
-        default=30,
+        default=1,
         help="要随机抽取多少个 (env, traj) 任务；1 表示只跑一个任务（兼容原来行为）",
     )
 
@@ -708,12 +710,12 @@ def parse_args():
         "--planners",
         nargs="+",
         type=str,
-        default=["BITStar", "NIBITStar", "IRRTStar"],
+        default=["IRRTSTAR","NIRRTSTAR"],
         help="要对比的规划算法，例如: --planners BITStar NIBITStar",
     )
 
     # BIT*/NIBIT* 公共参数
-    parser.add_argument("--iter_max", type=int, default=1000)
+    parser.add_argument("--iter_max", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--pc_n_points", type=int, default=2048)
 
@@ -721,7 +723,7 @@ def parse_args():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="results/model_training/liche_pointnet/checkpoints/best_model.pt",
+        default="results/model_training/train_20251215-144528/best.pt",
     )
     parser.add_argument(
         "--voxel_resolution",

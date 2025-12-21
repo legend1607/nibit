@@ -479,6 +479,8 @@ class LicheEnv:
         sleep_interval: float = 0.05,
         interp_step: float = 0.05,
         cleanup_bodies: bool = True,
+        save_curve: bool = True,
+        save_file: str = "traj_001.csv",
     ) -> None:
         """
         渲染路径（带插值、渐变、半透明机械臂显示）
@@ -533,6 +535,26 @@ class LicheEnv:
                     rgba = list(data[-1])
                     rgba[-1] = 0.5
                     p.changeVisualShape(new_robot, data[1], rgbaColor=rgba)
+        
+        # === 保存轨迹到 CSV ===
+        if save_curve and save_file:
+            import csv
+            import os
+
+            os.makedirs(os.path.dirname(save_file) or ".", exist_ok=True)
+
+            # path: (T, dof)
+            dof = len(path[0])
+            header = ["t"] + [f"q{i}" for i in range(dof)] + ["ee_x", "ee_y", "ee_z"]
+
+            with open(save_file, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                for t, q in enumerate(path):
+                    ee = self.get_end_effector_pos(q)  # (x,y,z)
+                    w.writerow([t, *list(q), *list(ee)])
+
+            print(f"[LicheEnv] Trajectory saved to: {save_file}")
 
             if self.GUI:
                 time.sleep(sleep_interval)

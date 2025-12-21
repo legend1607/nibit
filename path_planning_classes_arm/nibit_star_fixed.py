@@ -26,96 +26,6 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # 触发 3D 投影注册
 
 
-def visualize_nn_predictions(
-    joints_np,
-    labels_pred,
-    joints=None,
-    title="NN predictions in joint space",
-    save_path=None,
-    show=True,
-):
-    """
-    可视化一批关节空间采样点的“预测标签”：
-      - label=0: 碰撞
-      - label=1: 自由空间
-      - label=2: 路径附近（path）
-    """
-    joints_np = np.asarray(joints_np, dtype=float)
-    labels_pred = np.asarray(labels_pred, dtype=int)
-
-    N, D = joints_np.shape
-    if D < 3:
-        raise ValueError(f"维度 D={D} < 3，无法做 3D 可视化")
-
-    if joints is None:
-        joints = np.random.choice(D, size=3, replace=False)
-    else:
-        joints = np.array(joints, dtype=int)
-        if joints.shape[0] != 3:
-            raise ValueError(f"joints 长度必须为3，当前为 {joints.shape[0]}")
-        if np.any(joints < 0) or np.any(joints >= D):
-            raise ValueError(f"关节索引越界，合法范围 0~{D-1}，得到 {joints}")
-    joints = np.sort(joints)
-
-    print(f"[NN VIS] 使用关节维度 (作为 XYZ) = {joints.tolist()}")
-
-    # 投影到选中的 3 维
-    pts_proj = joints_np[:, joints]  # (N,3)
-
-    # 构造 mask
-    mask_collision = (labels_pred == 0)
-    mask_free      = (labels_pred == 1)
-    mask_path      = (labels_pred == 2)
-
-    print(f"[NN VIS] 预测 label=2(path) 点数: {mask_path.sum()} / {N}")
-    print(f"[NN VIS] 预测 label=1(free) 点数: {mask_free.sum()} / {N}")
-    print(f"[NN VIS] 预测 label=0(coll) 点数: {mask_collision.sum()} / {N}")
-
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # 自由空间点
-    if np.any(mask_free):
-        ax.scatter(
-            pts_proj[mask_free, 0],
-            pts_proj[mask_free, 1],
-            pts_proj[mask_free, 2],
-            c='g', s=4, alpha=0.25, label="NN free (1)"
-        )
-
-    # 碰撞点
-    if np.any(mask_collision):
-        ax.scatter(
-            pts_proj[mask_collision, 0],
-            pts_proj[mask_collision, 1],
-            pts_proj[mask_collision, 2],
-            c='r', s=4, alpha=0.5, marker="x", label="NN collision (0)"
-        )
-
-    # 路径点
-    if np.any(mask_path):
-        ax.scatter(
-            pts_proj[mask_path, 0],
-            pts_proj[mask_path, 1],
-            pts_proj[mask_path, 2],
-            c='b', s=8, alpha=0.9, label="NN path (2)"
-        )
-
-    ax.set_xlabel(f"joint {joints[0]}")
-    ax.set_ylabel(f"joint {joints[1]}")
-    ax.set_zlabel(f"joint {joints[2]}")
-    ax.set_title(title)
-    ax.legend(loc="best")
-    plt.tight_layout()
-
-    if save_path is not None:
-        plt.savefig(save_path, dpi=300)
-        print(f"[NN VIS] 图已保存到: {save_path}")
-
-    if show:
-        plt.show()
-
-
 class NIBITStar:
     def __init__(
         self,
@@ -175,18 +85,27 @@ class NIBITStar:
         self.n_free_points = 2
         self.path = []
         # ========= 自适应 near-path 距离阈值 =========
-        self.free_th = 0.6   # 判定为 free 的概率阈值，0.5~0.8 可调
-        self.tau = 0.6      # 初始“近路径”距离阈值
-        self.tau_min  = 0.05     # 最小阈值（越小越精细）
-        self.tau_shrink = 0.98   # 每次迭代默认收缩比例
-        self.tau_shrink_fast = 0.90  # 找到解后更快收缩
+        self.free_th = 0.6   # P(free) 初始阈值（过严会在采样阶段自适应下调）
+        self.free_th_min = 0.4
+        self.free_th_relax = 0.90  # free 过滤为空时：free_th *= relax
 
+        # ===== path 阈值（与 single_test 的 path_threshold 对齐）=====
+        self.tau_init = 0.1      # 初始 path 阈值
+        self.tau = 0.7      # 初始 path 阈值
+        self.tau_max = 0.90   # 有初始解后逐步提高到这里
+        self.tau_inc = 0.05   # 每次迭代提高的步长（可调）
+
+        # 采样配比：从 (p_path>=tau) 与 (p_path<tau) 两侧按比例取点
+        self.path_high_ratio = 0.40  # 阈值之上取点比例；阈值之下随机补齐
         self.has_solution = False
+        self.vis_debug = False
+        self.debug_vis = False      # 默认关
+        self.vis_joints =  [0,1,2]      # 或固定 [0,1,2]
+        self.vis_save_path = None   # 例如 "vis.png"
 
-    # ---------- helper: convert any point-like to hashable tuple ----------
-    def to_key(self, point, ndigits=6):
+    def  to_key(self, point, ndigits=6):
         """
-        将点转为 tuple(key)。
+     将点转为 tuple(key)。
         """
         if point is None:
             raise ValueError("Cannot convert None to key")
@@ -277,14 +196,96 @@ class NIBITStar:
         x = r * u / norm
         return x
 
-    def sample_from_env(self, c_best, batch_size, vertices=None):
+    def _vis_pointcloud_split(
+        self,
+        joints_np,
+        p_free,
+        p_path,
+        free_mask,
+        high_idx,
+        low_idx,
+        selected_idx=None,
+        free_th=None,
+        tau=None,
+        title="nn split",
+        block=False,
+    ):
+        """
+        joints_np: (N, D) 至少前三维是 xyz
+        p_free, p_path: (N,)
+        free_mask: (N,) bool
+        high_idx, low_idx: index array
+        selected_idx: list[int] 最终选中点索引（可选）
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        except Exception as e:
+            print("[vis] matplotlib not available:", e)
+            return
+
+        pts = np.asarray(joints_np, dtype=float)
+        if pts.shape[1] < 3:
+            print("[vis] need at least 3 dims for xyz, got", pts.shape)
+            return
+
+        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+        p_free = np.asarray(p_free).reshape(-1)
+        p_path = np.asarray(p_path).reshape(-1)
+
+        free_th = float(self.free_th if free_th is None else free_th)
+        tau = float(self.tau if tau is None else tau)
+
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # 1) 非 free 的点（灰色）
+        nonfree = np.where(~free_mask)[0]
+        if len(nonfree) > 0:
+            ax.scatter(x[nonfree], y[nonfree], z[nonfree], s=6, alpha=0.15, label="not free")
+
+        # 2) free & low（蓝色）
+        if len(low_idx) > 0:
+            ax.scatter(x[low_idx], y[low_idx], z[low_idx], s=10, alpha=0.5, label="free & low")
+
+        # 3) free & high（橙色）
+        if len(high_idx) > 0:
+            ax.scatter(x[high_idx], y[high_idx], z[high_idx], s=14, alpha=0.8, label="free & high")
+
+        # 4) 最终选中（红色，描边）
+        if selected_idx is not None and len(selected_idx) > 0:
+            sel = np.array(selected_idx, dtype=int)
+            ax.scatter(
+                x[sel], y[sel], z[sel],
+                s=60, alpha=0.95, label="selected",
+                edgecolors="k", linewidths=0.6
+            )
+
+        ax.set_title(
+            f"{title}\nfree_th={free_th:.3f}, tau={tau:.3f}, "
+            f"N={len(pts)}, free={int(np.sum(free_mask))}, high={len(high_idx)}, low={len(low_idx)}"
+        )
+        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+        ax.legend(loc="upper right")
+
+        # 可选：把概率信息写在图外（避免挡住点云）
+        txt = (
+            f"p_free: min={p_free.min():.3f}, mean={p_free.mean():.3f}, max={p_free.max():.3f}\n"
+            f"p_path: min={p_path.min():.3f}, mean={p_path.mean():.3f}, max={p_path.max():.3f}"
+        )
+        fig.text(0.02, 0.02, txt, fontsize=9)
+
+        plt.tight_layout()
+        plt.show(block=block)
+
+    def sample_from_env(self, c_best, batch_size):
         """
         使用 informed sampling（椭圆 + 全局）产生候选关节点，
         不做碰撞检测，统一交给神经网络打分：
         - 使用 P(path) 做 Top-K 选点
         """
 
-        def select_with_nn(candidates):
+        def select_with_nn(tau,candidates):
             if len(candidates) == 0:
                 return []
 
@@ -299,55 +300,107 @@ class NIBITStar:
 
             K = min(batch_size, len(joints_np))
 
-            # 1) free 过滤（与 single_test 一致：p_free = sigmoid(free_logit), label 1=free）
-            free_mask, _ = self.neural_wrapper.get_free_mask(joints_np, prob_th=self.free_th)
+            # ===== 统一一次 forward 拿到概率（推荐 wrapper 提供 predict_probs）=====
+            if hasattr(self.neural_wrapper, "predict_probs"):
+                p_free, p_path = self.neural_wrapper.predict_probs(joints_np)
+            else:
+                # 兼容旧接口：分别算 mask 时会多跑一次 forward（但仍保持语义一致）
+                free_mask_tmp, p_free = self.neural_wrapper.get_free_mask(joints_np, prob_th=0.0)
+                _, p_path = self.neural_wrapper.get_path_mask(joints_np, prob_th=0.0)
 
-            # 如果太严格导致一个 free 都没有，退回不做 free 过滤
-            if not np.any(free_mask):
-                free_mask = np.ones_like(free_mask, dtype=bool)
-
-            # 2) path 概率（与 single_test 一致：p_path = sigmoid(pathlogit)）
-            # 用 “safe path” 来得到 p_path，同时施加 path_th=self.tau（让 tau 表示 path_threshold）
-            safe_mask, p_path = self.neural_wrapper.get_safe_path_mask(
-                joints_np,
-                free_th=self.free_th,
-                path_th=self.tau,
-            )  # safe_mask = free & (p_path>=tau), p_path shape (N,)
-
+            p_free = np.asarray(p_free, dtype=float).reshape(-1)
             p_path = np.asarray(p_path, dtype=float).reshape(-1)
 
-            # 3) 先选 safe(near-path & free) 里 p_path 最大的
+            # ===== 1) 自适应 free 过滤：如果一个 free 都没有就下调 free_th =====
+            free_th = float(self.free_th)
+            free_mask = (p_free >= free_th)
+
+            while (not np.any(free_mask)) and (free_th > self.free_th_min + 1e-9):
+                free_th = max(self.free_th_min, free_th * self.free_th_relax)
+                free_mask = (p_free >= free_th)
+
+            # 持久化更新（下一轮采样继续用更“宽松”的阈值）
+            self.free_th = free_th
+
+            # 极端情况：仍无 free，就退化为不过滤
+            if not np.any(free_mask):
+                free_mask = np.ones_like(free_mask, dtype=bool)
+            # ===== 2) 按 path 阈值分两侧取点：上侧 Top， 下侧 Random =====
+            high_idx = np.where((p_path >= self.tau) & free_mask)[0]
+            low_idx  = np.where((p_path <  self.tau) & free_mask)[0]
+            if getattr(self, "vis_debug", False):
+                self._vis_pointcloud_split(
+                    joints_np=joints_np,
+                    p_free=p_free,
+                    p_path=p_path,
+                    free_mask=free_mask,
+                    high_idx=high_idx,
+                    low_idx=low_idx,
+                    selected_idx=None,
+                    free_th=self.free_th,
+                    tau=self.tau,
+                    title="after threshold split",
+                    block=False,
+                )
+
+            K = min(batch_size, len(joints_np))
+
+            # 目标配比（先算目标，再根据可用数量调整）
+            k_high_target = int(round(K * float(self.path_high_ratio)))
+            k_low_target  = K - k_high_target
+
+            # 高侧实际能取多少
+            k_high = min(k_high_target, len(high_idx))
+            # 高侧不足的缺口转给低侧（低侧目标增加）
+            k_low = min(k_low_target + (k_high_target - k_high), len(low_idx))
+
             selected_idx = []
-            safe_idx = np.where(safe_mask)[0]
 
-            if len(safe_idx) >= K:
-                order = safe_idx[np.argsort(-p_path[safe_idx])[:K]]
-                selected_idx = order.tolist()
-            else:
-                selected_idx = safe_idx.tolist()
+            # 高侧：按 p_path 从大到小取
+            if k_high > 0:
+                order_high = high_idx[np.argsort(-p_path[high_idx])]
+                selected_idx.extend(order_high[:k_high].tolist())
 
-                # 4) 不足则在 “free 点” 中按 p_path 从大到小补齐
-                remain = K - len(selected_idx)
-                if remain > 0:
-                    free_idx = np.where(free_mask)[0]
-                    free_sorted = free_idx[np.argsort(-p_path[free_idx])]
-                    for idx in free_sorted:
-                        if len(selected_idx) >= K:
-                            break
-                        if int(idx) not in selected_idx:
-                            selected_idx.append(int(idx))
+            # 低侧：随机取
+            if k_low > 0:
+                if len(low_idx) <= k_low:
+                    selected_idx.extend(low_idx.tolist())
+                else:
+                    chosen = np.random.choice(low_idx, size=k_low, replace=False)
+                    selected_idx.extend([int(i) for i in chosen])
 
-                # 5) 仍不够：退化到全体按 p_path 补齐
-                if len(selected_idx) < K:
-                    all_sorted = np.argsort(-p_path)
-                    for idx in all_sorted:
-                        if len(selected_idx) >= K:
-                            break
-                        if int(idx) not in selected_idx:
-                            selected_idx.append(int(idx))
+            # ===== 补齐策略（不改变你原来的兜底）=====
+            # 仍不足：在 free 点里按 p_path 从大到小补
+            if len(selected_idx) < K:
+                free_idx = np.where(free_mask)[0]
+                free_sorted = free_idx[np.argsort(-p_path[free_idx])]
+                s = set(int(x) for x in selected_idx)
+                for i in free_sorted:
+                    if len(selected_idx) >= K:
+                        break
+                    ii = int(i)
+                    if ii not in s:
+                        selected_idx.append(ii)
+                        s.add(ii)
+
+            # 仍不足（极端）：退化到全体按 p_path 补
+            if len(selected_idx) < K:
+                all_sorted = np.argsort(-p_path)
+                s = set(int(x) for x in selected_idx)
+                for i in all_sorted:
+                    if len(selected_idx) >= K:
+                        break
+                    ii = int(i)
+                    if ii not in s:
+                        selected_idx.append(ii)
+                        s.add(ii)
 
             selected = joints_np[np.array(selected_idx, dtype=int)]
+
+            # ===== 3) 调用点云可视化（可选开关，避免每次都弹窗）=====
+
             return [self.to_key(p) for p in selected]
+
 
         candidates = []
         oversample_factor = 10
@@ -369,7 +422,7 @@ class NIBITStar:
                     candidates.append(np.array(q, dtype=float))
                 if len(candidates) >= M:
                     break
-            return select_with_nn(candidates)
+            return select_with_nn(self.tau_init,candidates)
 
         # ---------- 情况 2：椭圆信息有效 ----------
         a = c_best / 2.0
@@ -411,7 +464,7 @@ class NIBITStar:
                 if len(candidates) >= M:
                     break
 
-        return select_with_nn(candidates)
+        return select_with_nn(self.tau,candidates)
 
     def is_point_free(self, point):
         numeric = np.array(point, dtype=float)
@@ -683,7 +736,7 @@ class NIBITStar:
             if not self.vertex_queue and not self.edge_queue:
                 c_best = self.get_g_score(self.goal)
                 self.prune(c_best)
-                new_samples = self.sample_from_env(c_best, self.batch_size, self.vertices)
+                new_samples = self.sample_from_env(c_best, self.batch_size)
                 new_samples = [self.to_key(p) for p in new_samples]
                 self.samples.extend(new_samples)
                 self.T += self.batch_size
@@ -798,14 +851,18 @@ class NIBITStar:
                 no_improve_count = 0
             else:
                 no_improve_count += 1
-            # ---- 更新自适应阈值 tau ----
+            # ---- 更新 path 阈值 tau（与 single_test 的 path_threshold 对齐）----
             if (not self.has_solution) and np.isfinite(g_goal):
-                # 第一次找到可行解
+                # 第一次找到可行解：开始逐步“收紧”到更靠近路径的区域（提高阈值）
                 self.has_solution = True
-                self.tau = max(self.tau_min, self.tau * self.tau_shrink_fast)
+
+            if self.has_solution:
+                # 有初始解后：逐步提高阈值，直到 tau_max
+                self.tau = min(self.tau_max, self.tau + self.tau_inc)
             else:
-                # 常规逐步收缩
-                self.tau = max(self.tau_min, self.tau * self.tau_shrink)
+                # 没有解前：保持初始阈值（更探索）
+                self.tau = float(self.tau)
+
 
             # 判定 1：找到直接连接的最优路径
             if (
@@ -845,11 +902,11 @@ class NIBITStar:
             time() - init_time,
             final_iter,
             iteration_costs,
-            # iteration_times,         # ✅ 新增
-            # first_solution_iter,
-            # first_solution_cost,
-            # first_solution_nodes,
-            # final_solution_nodes,
+            iteration_times,         # ✅ 新增
+            first_solution_iter,
+            first_solution_cost,
+            first_solution_nodes,
+            final_solution_nodes,
         )
 
 def get_bit_planner(

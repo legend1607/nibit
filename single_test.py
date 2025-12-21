@@ -355,7 +355,7 @@ def main():
         help='Path label / probability threshold，用于定义 path 区域'
     )
     parser.add_argument(
-        '--coll_threshold', type=float, default=0.7,
+        '--coll_threshold', type=float, default=0.6,
         help='Collision 概率阈值，p_coll > 该值视为碰撞'
     )
 
