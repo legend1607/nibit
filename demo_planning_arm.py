@@ -12,7 +12,7 @@ from environment.liche_env import LicheEnv
 import numpy as np
 import torch
 
-from model.encoders.joint_pointlite_encoder import JointPointNetEncoder
+from model.ECSP.encoders.joint_pointlite_encoder import JointPointNetEncoder
 
 # ------------------------------
 # 从 generate_random_world_arm_pc.py 复用体素生成函数
@@ -49,13 +49,6 @@ def voxelize_env(env_range, obstacles, resolution):
              idx_lo[2]:idx_hi[2] + 1] = 1
 
     return grid
-
-# ------------------------------
-# NeuralWrapper 主体
-# ------------------------------
-import numpy as np
-import torch
-import torch.nn as nn
 
 # ============================================================
 # 1. 读取 envs.json（由 generate_random_world_arm parallel.py 生成）
@@ -291,9 +284,9 @@ def main():
 
     elif args.path_planner == "NIBITStar":
         from path_planning_classes_arm.nibit_star_fixed import get_bit_planner
-        from neural_wrapper import NeuralWrapper
+        from neural_wrapper import ECSP_NeuralWrapper
         # 创建 NeuralWrapper：自动构建体素、加载模型、算 env_feat
-        neural_wrapper = NeuralWrapper(
+        neural_wrapper = ECSP_NeuralWrapper(
             problem=problem,
             ckpt_path="results/model_training/train_20251215-144528/best.pt",
             voxel_resolution=(50,50,50),

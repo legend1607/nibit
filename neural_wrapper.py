@@ -4,11 +4,11 @@ import torch
 # 你原工程里应当已有这两个符号：
 # - voxelize_env(env_range, obstacles, voxel_resolution)
 # - JointPointNetEncoder
-from model.encoders.joint_pointlite_encoder import JointPointNetEncoder
+from model.ECSP.encoders.joint_pointlite_encoder import JointPointNetEncoder
 from demo_planning_arm import voxelize_env  # 如果你的 voxelize_env 在别处，请改这里
 
 
-class NeuralWrapper:
+class ECSP_NeuralWrapper:
     """
     Inference wrapper for JointPointNetEncoder used by the planner.
 

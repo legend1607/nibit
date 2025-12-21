@@ -15,7 +15,7 @@ from demo_planning_arm import (
     get_env_configs,
     get_problem_input,
 )
-from neural_wrapper import NeuralWrapper
+from neural_wrapper import ECSP_NeuralWrapper
 from path_planning_classes_arm.bit_star import get_bit_planner as get_bit_planner_bit
 from path_planning_classes_arm.nibit_star_fixed import get_bit_planner as get_bit_planner_nibit
 from path_planning_classes_arm.irrtstar import get_irrtstar_planner,get_nirrtstar_planner
@@ -36,7 +36,7 @@ def build_planner(planner_name, args, problem, nw_cache):
 
     elif name == "NIBITSTAR":
         if "NIBITSTAR" not in nw_cache:
-            nw_cache["NIBITSTAR"] = NeuralWrapper(
+            nw_cache["NIBITSTAR"] = ECSP_NeuralWrapper(
                 problem=problem,
                 ckpt_path=args.ckpt,
                 voxel_resolution=tuple(args.voxel_resolution),
