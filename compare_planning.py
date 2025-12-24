@@ -18,7 +18,8 @@ from demo_planning_arm import (
 from neural_wrapper import ECSP_NeuralWrapper
 from path_planning_classes_arm.bit_star import get_bit_planner as get_bit_planner_bit
 from path_planning_classes_arm.nibit_star_fixed import get_bit_planner as get_bit_planner_nibit
-from path_planning_classes_arm.irrtstar import get_irrtstar_planner,get_nirrtstar_planner
+from path_planning_classes_arm.irrtstar import get_irrtstar_planner, get_nirrtstar_planner
+from path_planning_classes_arm.bifmtstar import get_bifmt_planner
 
 
 # ---------------------------
@@ -43,16 +44,25 @@ def build_planner(planner_name, args, problem, nw_cache):
                 device="cuda",
             )
         return get_bit_planner_nibit(args, problem, neural_wrapper=nw_cache["NIBITSTAR"])
+
     elif name == "IRRTSTAR":
-        # IRRT* 不需要 NeuralWrapper，直接构造
         return get_irrtstar_planner(args, problem, neural_wrapper=None)
+
     elif name == "NIRRTSTAR":
-        # IRRT* 不需要 NeuralWrapper，直接构造
-        return get_nirrtstar_planner(args, problem, neural_wrapper=None)
+        if "NIRRTSTAR" not in nw_cache:
+            nw_cache["NIRRTSTAR"] = ECSP_NeuralWrapper(
+                problem=problem,
+                ckpt_path=args.ckpt,
+                voxel_resolution=tuple(args.voxel_resolution),
+                device="cuda",
+            )
+        return get_nirrtstar_planner(args, problem, neural_wrapper=nw_cache["NIRRTSTAR"])
+
+    elif name == "BIFMTSTAR":
+        return get_bifmt_planner(args, problem, neural_wrapper=None)
 
     else:
         raise ValueError(f"未知的 planner: {planner_name}")
-
 
 
 # ---------------------------
@@ -130,18 +140,15 @@ def run_one_task_one_planner(planner_name, args, env_record, env_idx, traj_idx, 
                     first_iter_idx = i
                     break
             if has_path and first_iter_idx == -1:
-                # 有路径却没有有限 cost，退化：用最后一次迭代
                 first_iter_idx = len(iteration_costs) - 1
             if first_iter_idx >= 0:
                 first_solution_iter = first_iter_idx + 1
                 if first_solution_cost is None:
                     first_solution_cost = float(iteration_costs[first_iter_idx])
 
-    # 初始路径节点数如果 planner 没提供，用 -1 占位，后续统计时会过滤 <=0
     if first_solution_nodes is None:
         first_solution_nodes = -1
 
-    # 最终路径节点数：从最终 path 直接得到（所有 planner 都适用）
     if final_solution_nodes is None:
         final_solution_nodes = len(path) if has_path else -1
 
@@ -158,7 +165,6 @@ def run_one_task_one_planner(planner_name, args, env_record, env_idx, traj_idx, 
         print(f"[{planner_name}] First solution nodes: {first_solution_nodes}")
     else:
         print(f"[{planner_name}] First solution iter : N/A")
-
     print(f"[{planner_name}] Final path nodes     : {final_solution_nodes}")
 
     return {
@@ -179,42 +185,145 @@ def run_one_task_one_planner(planner_name, args, env_record, env_idx, traj_idx, 
         "first_solution_nodes": int(first_solution_nodes) if first_solution_nodes is not None else -1,
         # 最优解相关
         "final_solution_nodes": int(final_solution_nodes),
+        # difficulty 字段稍后填
+        "difficulty_bucket": -1,
+        "difficulty_value": float("nan"),
     }
+
+
+# ---------------------------
+# Difficulty bucket（按 task 划分）
+# ---------------------------
+def compute_task_optimal_metric(metrics, metric_name):
+    """
+    对每个 task=(env_idx,traj_idx)，计算一个“最优(oracle)”值：
+      - metric_name == "best_cost": 取成功样本里 best_cost 的最小值（越小越好）
+      - metric_name == "runtime":   取成功样本里 runtime   的最小值（越小越好）
+
+    返回:
+      task2val: dict[(env,traj)] -> float (若该 task 无任何成功样本，则为 inf)
+    """
+    from collections import defaultdict as dd
+
+    task2vals = dd(list)
+    for m in metrics:
+        if not m.get("success", False):
+            continue
+        key = (m["env_idx"], m["traj_idx"])
+        v = m.get(metric_name, float("inf"))
+        if v is None:
+            continue
+        if np.isfinite(v):
+            task2vals[key].append(float(v))
+
+    task2best = {}
+    all_tasks = {(m["env_idx"], m["traj_idx"]) for m in metrics}
+    for key in all_tasks:
+        if key in task2vals and len(task2vals[key]) > 0:
+            task2best[key] = float(np.min(task2vals[key]))
+        else:
+            task2best[key] = float("inf")
+    return task2best
+
+
+def assign_difficulty_buckets(metrics, metric_name="best_cost", num_buckets=3):
+    """
+    用分位数把 task 分成 num_buckets 个 bucket：
+      bucket 0: 最容易（metric 最小的一段）
+      bucket num_buckets-1: 最难（metric 最大的一段）
+
+    注意：这里 metric_name 表示“以 task 的最优(best) cost/runtime”作为难度指标（二选一）。
+    """
+    num_buckets = int(max(2, num_buckets))
+
+    task2best = compute_task_optimal_metric(metrics, metric_name)
+
+    # 只用 finite 值算分位数；inf（无成功）默认归到最难 bucket
+    finite_vals = np.array([v for v in task2best.values() if np.isfinite(v)], dtype=float)
+    if finite_vals.size == 0:
+        # 极端情况：所有 task 都失败
+        for m in metrics:
+            m["difficulty_bucket"] = num_buckets - 1
+            m["difficulty_value"] = float("inf")
+        edges = [float("inf")] * (num_buckets - 1)
+        return edges, task2best
+
+    # 分位数切分点：例如 3 buckets -> q=[1/3, 2/3]
+    qs = [k / num_buckets for k in range(1, num_buckets)]
+    edges = [float(np.quantile(finite_vals, q)) for q in qs]
+
+    def bucket_of(v):
+        if not np.isfinite(v):
+            return num_buckets - 1
+        b = 0
+        while b < len(edges) and v > edges[b]:
+            b += 1
+        return b
+
+    for m in metrics:
+        key = (m["env_idx"], m["traj_idx"])
+        v = task2best.get(key, float("inf"))
+        m["difficulty_value"] = float(v)
+        m["difficulty_bucket"] = int(bucket_of(v))
+
+    return edges, task2best
+
+
+def bucket_name(b, num_buckets):
+    if num_buckets == 3:
+        return ["easy", "medium", "hard"][b]
+    return f"bucket{b}"
+
+
+def filter_metrics(metrics, bucket=None):
+    if bucket is None:
+        return metrics
+    return [m for m in metrics if int(m.get("difficulty_bucket", -1)) == int(bucket)]
 
 
 # ---------------------------
 # 画平均迭代曲线 (iteration vs cost)
 # ---------------------------
-def plot_avg_iteration_curves(iter_curves_by_planner, out_path):
+def plot_avg_iteration_curves(metrics, out_path, bucket=None):
     """
-    iter_curves_by_planner: dict[planner_name] = [list_of_iteration_costs_list]
-    每个 list 是一条任务的 iteration_costs。
+    从 metrics 里按 planner 分组画平均 iteration-cost 曲线（mean ± std）。
+    可选按 difficulty bucket 过滤。
     """
+    ms = filter_metrics(metrics, bucket=bucket)
     plt.figure()
 
+    planners = sorted({m["planner"] for m in ms})
     any_curve = False
-    for name, seqs in iter_curves_by_planner.items():
+
+    for name in planners:
+        seqs = []
+        for m in ms:
+            if m["planner"] != name:
+                continue
+            if not m.get("success", False):
+                continue
+            s = m.get("iteration_costs", []) or []
+            if len(s) > 0:
+                seqs.append(s)
+
         if not seqs:
             continue
 
-        # 统一长度：用“保持当前 best cost”向后填充
         max_len = max(len(s) for s in seqs if len(s) > 0)
         if max_len == 0:
             continue
 
         arr = []
         for s in seqs:
-            if len(s) == 0:
-                continue
             tmp = np.empty(max_len, dtype=float)
             tmp[:len(s)] = s
-            tmp[len(s):] = s[-1]   # 后面保持最后的 best cost
+            tmp[len(s):] = s[-1]
             arr.append(tmp)
 
         if len(arr) == 0:
             continue
 
-        mat = np.vstack(arr)  # (num_tasks, max_len)
+        mat = np.vstack(arr)
         mean = mat.mean(axis=0)
         std = mat.std(axis=0)
 
@@ -230,7 +339,10 @@ def plot_avg_iteration_curves(iter_curves_by_planner, out_path):
 
     plt.xlabel("Iteration")
     plt.ylabel("Best cost so far (mean ± std)")
-    plt.title("Average iteration-cost curves over tasks")
+    title = "Average iteration-cost curves over tasks"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
     plt.grid(True)
     plt.legend()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -240,44 +352,153 @@ def plot_avg_iteration_curves(iter_curves_by_planner, out_path):
 
 
 # ---------------------------
-# 画平均时间曲线 (time vs cost)
+# 画成功率曲线 (Success Rate vs Iteration)
 # ---------------------------
-def plot_avg_time_curves(time_curves_by_planner, out_path):
+def plot_success_rate_over_iterations(metrics, out_path, bucket=None):
     """
-    time_curves_by_planner:
-        dict[planner_name] = [ (time_list, cost_list), ... ]
-    画：时间 t vs best_cost(t) 的平均曲线（带标准差）
+    画：Success Rate vs Iteration（按 planner 分组）
+    规则：若 iteration_costs 在某次迭代变为 finite，则从该迭代起视为“已成功”。
+    可选按 difficulty bucket 过滤。
     """
+    ms = filter_metrics(metrics, bucket=bucket)
     plt.figure()
+
+    planners = sorted({m["planner"] for m in ms})
     any_curve = False
 
-    for name, seqs in time_curves_by_planner.items():
+    for p in planners:
+        seqs = []
+        for m in ms:
+            if m["planner"] != p:
+                continue
+            seqs.append(m.get("iteration_costs", []) or [])
+
         if not seqs:
             continue
 
-        # 找到该 planner 下的最大时间
-        max_t = 0.0
-        for times, costs in seqs:
-            if times and len(times) > 0:
-                max_t = max(max_t, float(times[-1]))
-        if max_t <= 0:
+        max_len = max((len(s) for s in seqs), default=0)
+        if max_len == 0:
             continue
 
-        # 建一个统一的时间网格
-        time_grid = np.linspace(0.0, max_t, num=100)
+        success_mat = []
+        for s in seqs:
+            if len(s) == 0:
+                success_mat.append(np.zeros(max_len, dtype=float))
+                continue
 
+            s_arr = np.array(s, dtype=float)
+            if len(s_arr) < max_len:
+                pad = np.full(max_len - len(s_arr), s_arr[-1], dtype=float)
+                s_arr = np.concatenate([s_arr, pad], axis=0)
+
+            success_vec = np.isfinite(s_arr).astype(float)
+            success_mat.append(success_vec)
+
+        mat = np.vstack(success_mat)
+        success_rate = mat.mean(axis=0)
+
+        iters = np.arange(1, max_len + 1)
+        plt.plot(iters, success_rate, label=p)
+        any_curve = True
+
+    if not any_curve:
+        print("[WARN] 没有可用的 success-rate 曲线来画图。")
+        return
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Success rate")
+    title = "Success rate over iterations"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
+    plt.ylim(0.0, 1.0)
+    plt.grid(True)
+    plt.legend()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[INFO] Success-rate 曲线图已保存到: {out_path}")
+
+
+# ---------------------------
+# 画平均时间曲线 (time vs cost)
+# ---------------------------
+def plot_avg_time_curves(metrics, out_path, bucket=None):
+    """
+    画：时间 t vs best_cost(t) 的平均曲线（带标准差）
+    ✅ 改进：统一使用公共时间区间 [0, min(max_t_planner)] 做均值，避免不同 planner 覆盖时间段不同导致均值不可比
+    """
+    ms = filter_metrics(metrics, bucket=bucket)
+    plt.figure()
+
+    planners = sorted({m["planner"] for m in ms})
+
+    # 1) 先收集每个 planner 的 (times,costs) 序列，并计算各自的 max_t
+    seqs_by_planner = {}
+    max_t_by_planner = {}
+    for name in planners:
+        seqs = []
+        max_t = 0.0
+        for m in ms:
+            if m["planner"] != name:
+                continue
+            if not m.get("success", False):
+                continue
+            times = m.get("iteration_time_costs", []) or []
+            costs = m.get("iteration_costs", []) or []
+            if not times or not costs:
+                continue
+            if len(times) < 2 or len(costs) < 2:
+                continue
+            # 防御：长度对齐
+            L = min(len(times), len(costs))
+            times = times[:L]
+            costs = costs[:L]
+            # 防御：最后时间必须 > 0
+            if times[-1] is None or float(times[-1]) <= 0:
+                continue
+            seqs.append((times, costs))
+            max_t = max(max_t, float(times[-1]))
+
+        if seqs:
+            seqs_by_planner[name] = seqs
+            max_t_by_planner[name] = max_t
+
+    if not seqs_by_planner:
+        print("[WARN] 没有可用的 time 曲线来画平均图。")
+        return
+
+    # 2) 公共时间上界：min(max_t_planner)
+    T_common = min(max_t_by_planner.values())
+    if T_common <= 0:
+        print("[WARN] 公共时间上界无效，无法绘图。")
+        return
+
+    # 3) 统一时间网格（公共区间）
+    time_grid = np.linspace(0.0, T_common, num=100)
+
+    # 4) 对每个 planner：只在 [0, T_common] 上插值并平均
+    any_curve = False
+    for name, seqs in seqs_by_planner.items():
         arr = []
         for times, costs in seqs:
-            if not times or not costs or len(times) < 2 or len(costs) < 2:
-                continue
             t_arr = np.array(times, dtype=float)
             c_arr = np.array(costs, dtype=float)
 
-            # 确保时间严格递增（去掉重复）
+            # 去重 + 保序（确保时间单调）
             t_arr, unique_idx = np.unique(t_arr, return_index=True)
             c_arr = c_arr[unique_idx]
 
-            # 插值到统一时间网格
+            # 只保留 t <= T_common 的部分
+            mask = t_arr <= T_common
+            t_arr = t_arr[mask]
+            c_arr = c_arr[mask]
+
+            # 插值至少要2个点；否则跳过该任务曲线
+            if t_arr.size < 2:
+                continue
+
+            # 插值到公共网格
             interp_cost = np.interp(time_grid, t_arr, c_arr)
             arr.append(interp_cost)
 
@@ -290,42 +511,42 @@ def plot_avg_time_curves(time_curves_by_planner, out_path):
 
         plt.plot(time_grid, mean, label=name)
         plt.fill_between(time_grid, mean - std, mean + std, alpha=0.2)
-
         any_curve = True
 
     if not any_curve:
-        print("[WARN] 没有可用的 time 曲线来画平均图。")
+        print("[WARN] 没有 planner 在公共区间内有足够数据来画 time 曲线。")
         return
 
     plt.xlabel("Time (s)")
     plt.ylabel("Best cost so far (mean ± std)")
-    plt.title("Average time-cost curves over tasks")
+    title = "Average time-cost curves over tasks"
+    if bucket is not None:
+        title += f" ({bucket})"
+    title += f" | common T={T_common:.3f}s"
+    plt.title(title)
     plt.grid(True)
     plt.legend()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[INFO] 平均时间-代价曲线图已保存到: {out_path}")
-
+    print(f"[INFO] 平均时间-代价曲线图(公共区间)已保存到: {out_path} (T_common={T_common:.3f}s)")
 
 # ---------------------------
 # 画 scatter：x vs best_cost（原始）
 # ---------------------------
-def plot_scatter_x_cost(metrics, x_key, out_path, x_label):
-    """
-    metrics: list[dict]，每个 dict 含有 planner, best_cost, x_key
-    """
+def plot_scatter_x_cost(metrics, x_key, out_path, x_label, success_only=True, bucket=None):
     plt.figure()
-    planners = sorted({m["planner"] for m in metrics})
+    ms = filter_metrics(metrics, bucket=bucket)
+    planners = sorted({m["planner"] for m in ms})
 
     any_point = False
     for p in planners:
         xs = []
         ys = []
-        for m in metrics:
+        for m in ms:
             if m["planner"] != p:
                 continue
-            if not m["success"]:
+            if success_only and not m.get("success", False):
                 continue
             val = m.get(x_key, None)
             if val is None:
@@ -338,12 +559,15 @@ def plot_scatter_x_cost(metrics, x_key, out_path, x_label):
         any_point = True
 
     if not any_point:
-        print(f"[WARN] 无法绘制 {x_key} vs cost 散点图（没有成功样本）。")
+        print(f"[WARN] 无法绘制 {x_key} vs cost 散点图（没有有效样本）。")
         return
 
     plt.xlabel(x_label)
     plt.ylabel("Best cost")
-    plt.title(f"{x_label} vs Best cost")
+    title = f"{x_label} vs Best cost"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
     plt.grid(True)
     plt.legend()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -355,17 +579,15 @@ def plot_scatter_x_cost(metrics, x_key, out_path, x_label):
 # ---------------------------
 # 通用 scatter：x vs y
 # ---------------------------
-def plot_scatter_xy(metrics, x_key, y_key, out_path, x_label, y_label, success_only=True):
-    """
-    通用散点图：按 planner 分组画 x vs y。
-    """
+def plot_scatter_xy(metrics, x_key, y_key, out_path, x_label, y_label, success_only=True, bucket=None):
     plt.figure()
-    planners = sorted({m["planner"] for m in metrics})
+    ms = filter_metrics(metrics, bucket=bucket)
+    planners = sorted({m["planner"] for m in ms})
 
     any_point = False
     for p in planners:
         xs, ys = [], []
-        for m in metrics:
+        for m in ms:
             if m["planner"] != p:
                 continue
             if success_only and not m.get("success", False):
@@ -390,7 +612,10 @@ def plot_scatter_xy(metrics, x_key, y_key, out_path, x_label, y_label, success_o
 
     plt.xlabel(x_label)
     plt.ylabel(y_label)
-    plt.title(f"{x_label} vs {y_label}")
+    title = f"{x_label} vs {y_label}"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
     plt.grid(True)
     plt.legend()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -402,35 +627,18 @@ def plot_scatter_xy(metrics, x_key, y_key, out_path, x_label, y_label, success_o
 # ---------------------------
 # 画某个指标的直方图 + 箱线图
 # ---------------------------
-def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_only=True):
-    """
-    为某个指标绘制直方图和箱线图（按 planner 分组）。
-
-    metrics: list[dict]
-    value_key:
-        - "first_solution_iter"
-        - "first_solution_cost"
-        - "first_solution_nodes"
-        - "final_iter_plus1"  -> m["final_iter"] + 1
-        - "best_cost"
-        - "final_solution_nodes"
-        - "runtime"
-        - "avg_iter_time"
-        - "time_to_threshold"
-    out_prefix: 输出文件前缀，不含后缀，例如 ".../first_iter_stats_xxx"
-    x_label: 坐标轴 / 标题中使用的名称
-    success_only: True 时只统计成功的样本
-    """
+def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_only=True, bucket=None):
     by_planner = defaultdict(list)
+    ms = filter_metrics(metrics, bucket=bucket)
 
-    for m in metrics:
+    for m in ms:
         if success_only and not m.get("success", False):
             continue
 
         if value_key == "final_iter_plus1":
             v = m.get("final_iter", -1)
             if v >= 0:
-                v = v + 1  # 1-based
+                v = v + 1
         elif value_key in (
             "first_solution_iter",
             "first_solution_cost",
@@ -443,17 +651,13 @@ def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_on
         ):
             v = m.get(value_key, None)
         else:
-            # 允许扩展更多 key
             v = m.get(value_key, None)
 
         if v is None:
             continue
-
-        # 过滤掉 inf / nan
         if isinstance(v, (int, float)) and not np.isfinite(v):
             continue
 
-        # 对迭代数 / 节点数类指标，过滤掉 <=0 的值
         if value_key in ("first_solution_iter", "first_solution_nodes", "final_iter_plus1", "final_solution_nodes"):
             if v <= 0:
                 continue
@@ -472,7 +676,10 @@ def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_on
         plt.hist(vals, bins="auto", alpha=0.6, label=p)
     plt.xlabel(x_label)
     plt.ylabel("Count")
-    plt.title(f"Histogram of {x_label}")
+    title = f"Histogram of {x_label}"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
     plt.grid(True)
     plt.legend()
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
@@ -488,7 +695,10 @@ def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_on
     plt.boxplot(data, labels=planners_sorted, showmeans=True)
     plt.xlabel("Planner")
     plt.ylabel(x_label)
-    plt.title(f"Boxplot of {x_label}")
+    title = f"Boxplot of {x_label}"
+    if bucket is not None:
+        title += f" ({bucket})"
+    plt.title(title)
     plt.grid(True, axis="y")
     box_path = out_prefix + "_box.png"
     plt.savefig(box_path, dpi=150, bbox_inches="tight")
@@ -500,17 +710,16 @@ def plot_metric_hist_and_box(metrics, value_key, out_prefix, x_label, success_on
 # 保存 CSV / NPY
 # ---------------------------
 def save_metrics(metrics, out_csv, out_npy):
-    """
-    metrics: list[dict]
-    """
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
 
-    # CSV 字段顺序
     fieldnames = [
         "planner",
         "env_idx",
         "traj_idx",
         "success",
+        # difficulty
+        "difficulty_bucket",
+        "difficulty_value",
         # 初始解
         "first_solution_iter",
         "first_solution_cost",
@@ -537,6 +746,8 @@ def save_metrics(metrics, out_csv, out_npy):
                 "env_idx": m["env_idx"],
                 "traj_idx": m["traj_idx"],
                 "success": int(m["success"]),
+                "difficulty_bucket": int(m.get("difficulty_bucket", -1)),
+                "difficulty_value": float(m.get("difficulty_value", float("nan"))),
                 "first_solution_iter": m.get("first_solution_iter", -1),
                 "first_solution_cost": m.get("first_solution_cost", float("inf")),
                 "first_solution_nodes": m.get("first_solution_nodes", -1),
@@ -546,139 +757,100 @@ def save_metrics(metrics, out_csv, out_npy):
                 "runtime": m["runtime"],
                 "n_checks": m["n_checks"],
                 "total_samples": m["total_samples"],
-                "num_iters": len(m["iteration_costs"]),
+                "num_iters": len(m.get("iteration_costs", [])),
                 "avg_iter_time": m.get("avg_iter_time", float("nan")),
                 "time_to_threshold": m.get("time_to_threshold", float("inf")),
             }
             writer.writerow(row)
     print(f"[INFO] 统计已保存到 CSV: {out_csv}")
 
-    # NPY：存原始 dict 列表
     np.save(out_npy, metrics, allow_pickle=True)
     print(f"[INFO] 统计已保存到 NPY:  {out_npy}")
 
 
 # ---------------------------
-# 打印统计：均值 / 方差 / 成功率
+# 打印统计：均值 / 方差 / 成功率（支持按 bucket）
 # ---------------------------
-def print_summary(metrics):
-    by_planner = defaultdict(list)
-    for m in metrics:
-        by_planner[m["planner"]].append(m)
+def print_summary(metrics, num_buckets=3):
+    def _print_one(group_name, group_metrics):
+        by_planner = defaultdict(list)
+        for m in group_metrics:
+            by_planner[m["planner"]].append(m)
 
-    print("\n========== 批量统计结果 ==========")
-    for p, lst in by_planner.items():
-        runtimes = np.array([m["runtime"] for m in lst], dtype=float)
-        checks = np.array([m["n_checks"] for m in lst], dtype=float)
-        iters = np.array([m["final_iter"] + 1 for m in lst], dtype=float)
-        success_flags = np.array([m["success"] for m in lst], dtype=int)
+        print(f"\n========== 统计结果: {group_name} ==========")
+        for p, lst in by_planner.items():
+            runtimes = np.array([m["runtime"] for m in lst], dtype=float)
+            checks = np.array([m["n_checks"] for m in lst], dtype=float)
+            iters = np.array([m["final_iter"] + 1 for m in lst], dtype=float)
+            success_flags = np.array([m["success"] for m in lst], dtype=int)
 
-        # 只统计成功样本的 cost / 节点数
-        costs = np.array(
-            [m["best_cost"] for m in lst if m["success"]],
-            dtype=float,
-        )
-        first_iters = np.array(
-            [
-                m.get("first_solution_iter", -1)
-                for m in lst
-                if m["success"] and m.get("first_solution_iter", -1) > 0
-            ],
-            dtype=float,
-        )
-        first_costs = np.array(
-            [
-                m.get("first_solution_cost", float("inf"))
-                for m in lst
-                if m["success"] and np.isfinite(m.get("first_solution_cost", float("inf")))
-            ],
-            dtype=float,
-        )
-        first_nodes = np.array(
-            [
-                m.get("first_solution_nodes", -1)
-                for m in lst
-                if m["success"] and m.get("first_solution_nodes", -1) > 0
-            ],
-            dtype=float,
-        )
-        final_nodes = np.array(
-            [
-                m.get("final_solution_nodes", -1)
-                for m in lst
-                if m["success"] and m.get("final_solution_nodes", -1) > 0
-            ],
-            dtype=float,
-        )
-
-        # 平均每迭代耗时（过滤 nan / inf）
-        avg_iter_times = np.array(
-            [m.get("avg_iter_time", np.nan) for m in lst],
-            dtype=float,
-        )
-        avg_iter_times = avg_iter_times[np.isfinite(avg_iter_times)]
-
-        # time-to-threshold（过滤 inf / nan）
-        time_to_threshold = np.array(
-            [m.get("time_to_threshold", np.nan) for m in lst],
-            dtype=float,
-        )
-        time_to_threshold = time_to_threshold[np.isfinite(time_to_threshold)]
-
-        print(f"\n--- Planner: {p} ---")
-        print(f"样本数: {len(lst)}")
-        print(
-            f"成功数: {success_flags.sum()} / {len(lst)} "
-            f"(成功率 = {success_flags.mean() * 100:.1f}%)"
-        )
-
-        print(f"runtime 平均 / 方差: {runtimes.mean():.4f} / {runtimes.var():.4f}")
-        print(f"collision_checks 平均 / 方差: {checks.mean():.1f} / {checks.var():.1f}")
-        print(f"iterations (final, 1-based) 平均 / 方差: {iters.mean():.1f} / {iters.var():.1f}")
-
-        if len(costs) > 0:
-            print(
-                f"best_cost (最终, 成功样本) 平均 / 方差: "
-                f"{costs.mean():.4f} / {costs.var():.4f}"
+            costs = np.array([m["best_cost"] for m in lst if m["success"]], dtype=float)
+            first_iters = np.array(
+                [m.get("first_solution_iter", -1) for m in lst
+                 if m["success"] and m.get("first_solution_iter", -1) > 0],
+                dtype=float,
+            )
+            first_costs = np.array(
+                [m.get("first_solution_cost", float("inf")) for m in lst
+                 if m["success"] and np.isfinite(m.get("first_solution_cost", float("inf")))],
+                dtype=float,
+            )
+            first_nodes = np.array(
+                [m.get("first_solution_nodes", -1) for m in lst
+                 if m["success"] and m.get("first_solution_nodes", -1) > 0],
+                dtype=float,
+            )
+            final_nodes = np.array(
+                [m.get("final_solution_nodes", -1) for m in lst
+                 if m["success"] and m.get("final_solution_nodes", -1) > 0],
+                dtype=float,
             )
 
-        if len(first_iters) > 0:
-            print(
-                f"first_solution_iter (成功样本, 1-based) 平均 / 方差: "
-                f"{first_iters.mean():.1f} / {first_iters.var():.1f}"
-            )
-        else:
-            print("first_solution_iter: 无成功样本或未记录。")
+            avg_iter_times = np.array([m.get("avg_iter_time", np.nan) for m in lst], dtype=float)
+            avg_iter_times = avg_iter_times[np.isfinite(avg_iter_times)]
 
-        if len(first_costs) > 0:
-            print(
-                f"first_solution_cost (成功样本) 平均 / 方差: "
-                f"{first_costs.mean():.4f} / {first_costs.var():.4f}"
-            )
+            time_to_threshold = np.array([m.get("time_to_threshold", np.nan) for m in lst], dtype=float)
+            time_to_threshold = time_to_threshold[np.isfinite(time_to_threshold)]
 
-        if len(first_nodes) > 0:
-            print(
-                f"first_solution_nodes (成功样本) 平均 / 方差: "
-                f"{first_nodes.mean():.1f} / {first_nodes.var():.1f}"
-            )
+            print(f"\n--- Planner: {p} ---")
+            print(f"样本数: {len(lst)}")
+            print(f"成功数: {success_flags.sum()} / {len(lst)} (成功率 = {success_flags.mean() * 100:.1f}%)")
 
-        if len(final_nodes) > 0:
-            print(
-                f"final_solution_nodes (成功样本) 平均 / 方差: "
-                f"{final_nodes.mean():.1f} / {final_nodes.var():.1f}"
-            )
+            print(f"runtime 平均 / 方差: {runtimes.mean():.4f} / {runtimes.var():.4f}")
+            print(f"collision_checks 平均 / 方差: {checks.mean():.1f} / {checks.var():.1f}")
+            print(f"iterations (final, 1-based) 平均 / 方差: {iters.mean():.1f} / {iters.var():.1f}")
 
-        if avg_iter_times.size > 0:
-            print(
-                f"avg_iter_time (每迭代耗时) 平均 / 方差: "
-                f"{avg_iter_times.mean():.6f} / {avg_iter_times.var():.6f}"
-            )
+            if len(costs) > 0:
+                print(f"best_cost (最终, 成功样本) 平均 / 方差: {costs.mean():.4f} / {costs.var():.4f}")
 
-        if time_to_threshold.size > 0:
-            print(
-                f"time_to_threshold (达阈值耗时) 平均 / 方差: "
-                f"{time_to_threshold.mean():.4f} / {time_to_threshold.var():.4f}"
-            )
+            if len(first_iters) > 0:
+                print(f"first_solution_iter (成功样本, 1-based) 平均 / 方差: {first_iters.mean():.1f} / {first_iters.var():.1f}")
+            else:
+                print("first_solution_iter: 无成功样本或未记录。")
+
+            if len(first_costs) > 0:
+                print(f"first_solution_cost (成功样本) 平均 / 方差: {first_costs.mean():.4f} / {first_costs.var():.4f}")
+
+            if len(first_nodes) > 0:
+                print(f"first_solution_nodes (成功样本) 平均 / 方差: {first_nodes.mean():.1f} / {first_nodes.var():.1f}")
+
+            if len(final_nodes) > 0:
+                print(f"final_solution_nodes (成功样本) 平均 / 方差: {final_nodes.mean():.1f} / {final_nodes.var():.1f}")
+
+            if avg_iter_times.size > 0:
+                print(f"avg_iter_time (每迭代耗时) 平均 / 方差: {avg_iter_times.mean():.6f} / {avg_iter_times.var():.6f}")
+
+            if time_to_threshold.size > 0:
+                print(f"time_to_threshold (达阈值耗时) 平均 / 方差: {time_to_threshold.mean():.4f} / {time_to_threshold.var():.4f}")
+
+    # all
+    _print_one("all", metrics)
+
+    # by bucket
+    for b in range(num_buckets):
+        ms = filter_metrics(metrics, bucket=b)
+        if ms:
+            _print_one(bucket_name(b, num_buckets), ms)
 
 
 # ---------------------------
@@ -686,72 +858,53 @@ def print_summary(metrics):
 # ---------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="批量对比多个 planner（BITStar/NIBITStar）并统计性能指标"
+        description="批量对比多个 planner 并统计性能指标（支持按难度分位数 bucket）"
     )
 
     # 数据相关
     parser.add_argument("--data_root", type=str, default="data/liche")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
 
-    # 批量任务数：1 = 单任务模式（随机或指定）；>1 = 多任务统计模式
-    parser.add_argument(
-        "--num_tasks",
-        type=int,
-        default=1,
-        help="要随机抽取多少个 (env, traj) 任务；1 表示只跑一个任务（兼容原来行为）",
-    )
+    # 批量任务数
+    parser.add_argument("--num_tasks", type=int, default=30,
+                        help="要随机抽取多少个 (env, traj) 任务；1 表示只跑一个任务")
 
-    # 如果你想固定 env/traj，就指定这两个；否则随机
+    # 如果你想固定 env/traj
     parser.add_argument("--env_idx", type=int, default=-1)
     parser.add_argument("--traj_idx", type=int, default=-1)
 
     # 规划算法列表
-    parser.add_argument(
-        "--planners",
-        nargs="+",
-        type=str,
-        default=["IRRTSTAR","NIRRTSTAR"],
-        help="要对比的规划算法，例如: --planners BITStar NIBITStar",
-    )
+    parser.add_argument("--planners", nargs="+", type=str, default=["IRRTSTAR", "NIRRTSTAR"],
+                        help="要对比的规划算法，例如: --planners BITStar NIBITStar")
 
     # BIT*/NIBIT* 公共参数
-    parser.add_argument("--iter_max", type=int, default=500)
+    parser.add_argument("--iter_max", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--pc_n_points", type=int, default=2048)
 
     # NIBIT 相关
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default="results/model_training/train_20251215-144528/best.pt",
-    )
-    parser.add_argument(
-        "--voxel_resolution",
-        type=int,
-        nargs=3,
-        default=[50, 50, 50],
-    )
+    parser.add_argument("--ckpt", type=str, default="results/model_training/train_20251215-144528/best.pt")
+    parser.add_argument("--voxel_resolution", type=int, nargs=3, default=[50, 50, 50])
 
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
 
     # 绝对阈值（可选）：所有任务共用
-    parser.add_argument(
-        "--cost_threshold",
-        type=float,
-        default=None,
-        help="全局绝对路径代价阈值，用于 time-to-threshold；"
-             "若同时设置了 --rel_cost_factor，则优先使用相对阈值",
-    )
+    parser.add_argument("--cost_threshold", type=float, default=None,
+                        help="全局绝对路径代价阈值，用于 time-to-threshold；"
+                             "若同时设置了 --rel_cost_factor，则优先使用相对阈值")
 
-    # 相对阈值（推荐）：基于“每个任务所有 planner 的最终最优 best_cost”
-    parser.add_argument(
-        "--rel_cost_factor",
-        type=float,
-        default=None,
-        help="若设置，例如 1.05，则对每个任务使用 rel_cost_factor * "
-             "(该任务所有planner中最终最优best_cost) 作为 time-to-threshold 的阈值",
-    )
+    # 相对阈值（推荐）
+    parser.add_argument("--rel_cost_factor", type=float, default=None,
+                        help="若设置，例如 1.05，则对每个任务使用 rel_cost_factor * "
+                             "(该任务所有planner中最终最优best_cost) 作为 time-to-threshold 的阈值")
+
+    # difficulty bucket（新增）
+    parser.add_argument("--difficulty_metric", type=str, default="runtime",
+                        choices=["best_cost", "runtime"],
+                        help="用 task 的最优 best_cost 或最优 runtime 来做难度分桶（分位数）")
+    parser.add_argument("--difficulty_buckets", type=int, default=3,
+                        help="分桶数量（>=2），例如 3 表示 easy/medium/hard")
 
     return parser.parse_args()
 
@@ -764,20 +917,15 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    # 加载环境列表
     env_list = get_env_configs(root_dir=args.data_root, split=args.split)
     num_env = len(env_list)
     print(f"[INFO] 共 {num_env} 个 env。")
 
     metrics = []
-    iter_curves_by_planner = defaultdict(list)
-    time_curves_by_planner = defaultdict(list)
 
-    # 决定任务数
     num_tasks = max(1, args.num_tasks)
 
     for task_id in range(num_tasks):
-        # 选择 env_idx
         if args.env_idx < 0 or args.env_idx >= num_env:
             env_idx = random.randrange(num_env)
         else:
@@ -785,24 +933,19 @@ def main():
 
         env_record = env_list[env_idx]
 
-        # 该 env 内的路径数
         starts = env_record.get("start", [])
         n_traj = len(starts)
         if n_traj == 0:
             print(f"[WARN] 环境 {env_idx} 中没有轨迹，跳过。")
             continue
 
-        # 选择 traj_idx
         if args.traj_idx < 0 or args.traj_idx >= n_traj:
             traj_idx = random.randrange(n_traj)
         else:
             traj_idx = args.traj_idx
 
         print("\n======================================")
-        print(
-            f"[TASK {task_id+1}/{num_tasks}] split={args.split}, env={env_idx}/{num_env-1}, "
-            f"traj={traj_idx}/{n_traj-1}"
-        )
+        print(f"[TASK {task_id+1}/{num_tasks}] split={args.split}, env={env_idx}/{num_env-1}, traj={traj_idx}/{n_traj-1}")
         print(f"[INFO] Planners: {args.planners}")
         print("======================================")
 
@@ -818,21 +961,13 @@ def main():
             )
             metrics.append(res)
 
-            if res["success"] and len(res["iteration_costs"]) > 0:
-                iter_curves_by_planner[planner_name].append(res["iteration_costs"])
-
-            if res["success"] and len(res.get("iteration_time_costs", [])) > 0:
-                time_curves_by_planner[planner_name].append(
-                    (res["iteration_time_costs"], res["iteration_costs"])
-                )
-
-    # 如果只跑 1 个任务，还画单任务的 iteration 对比图（带时间双轴）
+    # 单任务画对比图（保持原逻辑）
     if num_tasks == 1 and metrics:
         fig, ax1 = plt.subplots()
         has_cost = False
 
         for m in metrics:
-            costs = m["iteration_costs"]
+            costs = m.get("iteration_costs", [])
             if not costs:
                 continue
             iters = np.arange(1, len(costs) + 1)
@@ -844,7 +979,6 @@ def main():
             ax1.set_ylabel("Best cost so far")
             ax1.grid(True)
 
-            # 右轴：累计时间
             ax2 = ax1.twinx()
             has_time = False
             for m in metrics:
@@ -858,7 +992,6 @@ def main():
             if has_time:
                 ax2.set_ylabel("Time (s)")
 
-            # 合并 legend
             lines, labels = [], []
             for ax in (ax1, ax2):
                 h, l = ax.get_legend_handles_labels()
@@ -869,22 +1002,26 @@ def main():
 
             out_dir = os.path.join("results", "plots")
             os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(
-                out_dir,
-                f"compare_iter_cost_env{metrics[0]['env_idx']}_"
-                f"traj{metrics[0]['traj_idx']}.png",
-            )
-            fig.suptitle(
-                f"Iteration / time comparison (env {metrics[0]['env_idx']}, "
-                f"traj {metrics[0]['traj_idx']})"
-            )
+            out_path = os.path.join(out_dir, f"compare_iter_cost_env{metrics[0]['env_idx']}_traj{metrics[0]['traj_idx']}.png")
+            fig.suptitle(f"Iteration / time comparison (env {metrics[0]['env_idx']}, traj {metrics[0]['traj_idx']})")
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
             print(f"[INFO] 单任务迭代/时间曲线对比图已保存到: {out_path}")
 
     # 批量统计 + 画图
     if metrics:
-        # ---------- 先统计：每个 (env_idx, traj_idx) 的最优 best_cost ----------
+        # ---------- difficulty 分桶（新增） ----------
+        edges, task2best = assign_difficulty_buckets(
+            metrics,
+            metric_name=args.difficulty_metric,
+            num_buckets=args.difficulty_buckets,
+        )
+        print("\n========== Difficulty bucket ==========")
+        print(f"[INFO] difficulty_metric = {args.difficulty_metric}")
+        print(f"[INFO] difficulty_buckets = {args.difficulty_buckets}")
+        print(f"[INFO] quantile edges = {edges} (inf 或无成功任务自动归最难桶)")
+
+        # ---------- 先统计：每个 (env_idx, traj_idx) 的最优 best_cost（供 rel_cost_factor 使用） ----------
         from collections import defaultdict as dd2
 
         best_cost_by_task = dd2(lambda: float("inf"))
@@ -895,7 +1032,6 @@ def main():
                     best_cost_by_task[key] = m["best_cost"]
 
         # ---------- 计算时间相关的派生指标 ----------
-        # 平均每迭代耗时
         for m in metrics:
             num_iters = len(m.get("iteration_costs", []))
             if num_iters > 0 and m["runtime"] > 0:
@@ -903,9 +1039,6 @@ def main():
             else:
                 m["avg_iter_time"] = float("nan")
 
-        # 达到某个 cost 阈值所需时间
-        # 优先使用每任务相对最优的阈值 (--rel_cost_factor)，
-        # 若未设置，再退回全局绝对阈值 (--cost_threshold)
         for m in metrics:
             times = m.get("iteration_time_costs", [])
             costs = m.get("iteration_costs", [])
@@ -915,7 +1048,6 @@ def main():
 
             threshold = None
 
-            # 优先：相对每个任务的最优 best_cost
             if args.rel_cost_factor is not None:
                 alpha = float(args.rel_cost_factor)
                 key = (m["env_idx"], m["traj_idx"])
@@ -923,221 +1055,133 @@ def main():
                 if np.isfinite(base) and base > 0:
                     threshold = alpha * base
 
-            # 其次：旧的全局绝对阈值
             if threshold is None and args.cost_threshold is not None:
                 threshold = float(args.cost_threshold)
 
-            # 两种都没设，就不统计这个指标
             if threshold is None:
                 m["time_to_threshold"] = float("inf")
                 continue
 
-            # 找第一次 cost <= threshold 的时间
             tt = float("inf")
             for t, c in zip(times, costs):
                 if c <= threshold:
                     tt = float(t)
                     break
-
             m["time_to_threshold"] = tt
 
-        # 1) 打印统计
-        print_summary(metrics)
+        # 1) 打印统计（all + 各 bucket）
+        print_summary(metrics, num_buckets=args.difficulty_buckets)
 
         # 2) 保存 CSV / NPY
         stats_dir = os.path.join("results", "stats")
+        os.makedirs(stats_dir, exist_ok=True)
         csv_path = os.path.join(
             stats_dir,
-            f"stats_{args.split}_tasks{num_tasks}_seed{args.seed}.csv",
+            f"stats_{args.split}_tasks{num_tasks}_seed{args.seed}_"
+            f"diff{args.difficulty_metric}_B{args.difficulty_buckets}.csv",
         )
         npy_path = os.path.join(
             stats_dir,
-            f"stats_{args.split}_tasks{num_tasks}_seed{args.seed}.npy",
+            f"stats_{args.split}_tasks{num_tasks}_seed{args.seed}_"
+            f"diff{args.difficulty_metric}_B{args.difficulty_buckets}.npy",
         )
         save_metrics(metrics, csv_path, npy_path)
 
-        # 3) 平均迭代曲线 (iteration vs cost)
-        avg_plot_path = os.path.join(
-            "results",
-            "plots",
-            f"avg_iter_cost_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
-        )
-        plot_avg_iteration_curves(iter_curves_by_planner, avg_plot_path)
+        # 3) 平均迭代曲线 / 成功率曲线 / 平均时间曲线：all + 每个 bucket 各一份
+        plots_dir = os.path.join("results", "plots")
+        os.makedirs(plots_dir, exist_ok=True)
 
-        # 3b) 平均时间-代价曲线 (time vs cost)
-        avg_time_plot_path = os.path.join(
-            "results",
-            "plots",
-            f"avg_time_cost_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
+        # all
+        plot_avg_iteration_curves(
+            metrics,
+            os.path.join(plots_dir, f"avg_iter_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
+            bucket=None,
         )
-        plot_avg_time_curves(time_curves_by_planner, avg_time_plot_path)
-
-        # 4) 若干散点图：runtime / checks / first_iter vs cost
-        scatter_rt_path = os.path.join(
-            "results",
-            "plots",
-            f"rt_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
+        plot_success_rate_over_iterations(
+            metrics,
+            os.path.join(plots_dir, f"success_rate_iter_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
+            bucket=None,
         )
-        plot_scatter_x_cost(metrics, "runtime", scatter_rt_path, "Runtime (s)")
-
-        scatter_ck_path = os.path.join(
-            "results",
-            "plots",
-            f"checks_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
+        plot_avg_time_curves(
+            metrics,
+            os.path.join(plots_dir, f"avg_time_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
+            bucket=None,
         )
-        plot_scatter_x_cost(metrics, "n_checks", scatter_ck_path, "Collision checks")
 
-        scatter_first_iter_path = os.path.join(
-            "results",
-            "plots",
-            f"first_iter_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
+        # per bucket
+        for b in range(args.difficulty_buckets):
+            name = bucket_name(b, args.difficulty_buckets)
+            plot_avg_iteration_curves(
+                metrics,
+                os.path.join(plots_dir, f"avg_iter_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_{name}.png"),
+                bucket=b,
+            )
+            plot_success_rate_over_iterations(
+                metrics,
+                os.path.join(plots_dir, f"success_rate_iter_{args.split}_tasks{num_tasks}_seed{args.seed}_{name}.png"),
+                bucket=b,
+            )
+            plot_avg_time_curves(
+                metrics,
+                os.path.join(plots_dir, f"avg_time_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_{name}.png"),
+                bucket=b,
+            )
+
+        # 4) 若干散点图：all（你也可以按 bucket 复制一份）
+        plot_scatter_x_cost(
+            metrics,
+            "runtime",
+            os.path.join(plots_dir, f"rt_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
+            "Runtime (s)",
+            success_only=True,
+            bucket=None,
+        )
+        plot_scatter_x_cost(
+            metrics,
+            "n_checks",
+            os.path.join(plots_dir, f"checks_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
+            "Collision checks",
+            success_only=True,
+            bucket=None,
         )
         plot_scatter_x_cost(
             metrics,
             "first_solution_iter",
-            scatter_first_iter_path,
+            os.path.join(plots_dir, f"first_iter_vs_cost_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
             "First solution iter (1-based)",
-        )
-
-        # Runtime vs Total samples 散点图
-        rt_vs_samples_path = os.path.join(
-            "results",
-            "plots",
-            f"rt_vs_samples_{args.split}_tasks{num_tasks}_seed{args.seed}.png",
+            success_only=True,
+            bucket=None,
         )
         plot_scatter_xy(
             metrics,
             x_key="total_samples",
             y_key="runtime",
-            out_path=rt_vs_samples_path,
+            out_path=os.path.join(plots_dir, f"rt_vs_samples_{args.split}_tasks{num_tasks}_seed{args.seed}_all.png"),
             x_label="Total samples",
             y_label="Runtime (s)",
             success_only=False,
+            bucket=None,
         )
 
-        # 5) (a)~(c)：初始路径相关直方图 / 箱线图
-        first_iter_prefix = os.path.join(
-            "results",
-            "plots",
-            f"first_iter_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="first_solution_iter",
-            out_prefix=first_iter_prefix,
-            x_label="Initial path iteration (1-based)",
-            success_only=True,
-        )
+        # 5) 分布图（all）
+        def _pref(stem):
+            return os.path.join(
+                plots_dir,
+                f"{stem}_{args.split}_tasks{num_tasks}_seed{args.seed}_all"
+            )
 
-        first_cost_prefix = os.path.join(
-            "results",
-            "plots",
-            f"first_cost_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="first_solution_cost",
-            out_prefix=first_cost_prefix,
-            x_label="Initial path cost",
-            success_only=True,
-        )
+        plot_metric_hist_and_box(metrics, "first_solution_iter", _pref("first_iter_stats"), "Initial path iteration (1-based)", True, None)
+        plot_metric_hist_and_box(metrics, "first_solution_cost", _pref("first_cost_stats"), "Initial path cost", True, None)
+        plot_metric_hist_and_box(metrics, "first_solution_nodes", _pref("first_nodes_stats"), "Initial path nodes", True, None)
+        plot_metric_hist_and_box(metrics, "final_iter_plus1", _pref("final_iter_stats"), "Final iteration (1-based)", True, None)
+        plot_metric_hist_and_box(metrics, "best_cost", _pref("final_cost_stats"), "Final path cost", True, None)
+        plot_metric_hist_and_box(metrics, "final_solution_nodes", _pref("final_nodes_stats"), "Final path nodes", True, None)
+        plot_metric_hist_and_box(metrics, "runtime", _pref("runtime_stats"), "Runtime (s)", False, None)
 
-        first_nodes_prefix = os.path.join(
-            "results",
-            "plots",
-            f"first_nodes_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="first_solution_nodes",
-            out_prefix=first_nodes_prefix,
-            x_label="Initial path nodes",
-            success_only=True,
-        )
-
-        # 6) (d)~(f)：最优路径相关直方图 / 箱线图
-        final_iter_prefix = os.path.join(
-            "results",
-            "plots",
-            f"final_iter_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="final_iter_plus1",
-            out_prefix=final_iter_prefix,
-            x_label="Final iteration (1-based)",
-            success_only=True,
-        )
-
-        final_cost_prefix = os.path.join(
-            "results",
-            "plots",
-            f"final_cost_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="best_cost",
-            out_prefix=final_cost_prefix,
-            x_label="Final path cost",
-            success_only=True,
-        )
-
-        final_nodes_prefix = os.path.join(
-            "results",
-            "plots",
-            f"final_nodes_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="final_solution_nodes",
-            out_prefix=final_nodes_prefix,
-            x_label="Final path nodes",
-            success_only=True,
-        )
-
-        # 7) runtime 分布（所有样本）
-        runtime_prefix = os.path.join(
-            "results",
-            "plots",
-            f"runtime_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="runtime",
-            out_prefix=runtime_prefix,
-            x_label="Runtime (s)",
-            success_only=False,
-        )
-
-        # 8) time-to-threshold 分布（仅当设置了阈值时绘制）
         if args.rel_cost_factor is not None or args.cost_threshold is not None:
-            tth_prefix = os.path.join(
-                "results",
-                "plots",
-                f"time_to_threshold_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-            )
-            label = "Time to threshold (s)"
-            plot_metric_hist_and_box(
-                metrics,
-                value_key="time_to_threshold",
-                out_prefix=tth_prefix,
-                x_label=label,
-                success_only=True,
-            )
+            plot_metric_hist_and_box(metrics, "time_to_threshold", _pref("time_to_threshold_stats"), "Time to threshold (s)", True, None)
 
-        # 9) 平均每迭代耗时分布
-        avg_it_time_prefix = os.path.join(
-            "results",
-            "plots",
-            f"avg_iter_time_stats_{args.split}_tasks{num_tasks}_seed{args.seed}",
-        )
-        plot_metric_hist_and_box(
-            metrics,
-            value_key="avg_iter_time",
-            out_prefix=avg_it_time_prefix,
-            x_label="Average iteration time (s)",
-            success_only=False,
-        )
+        plot_metric_hist_and_box(metrics, "avg_iter_time", _pref("avg_iter_time_stats"), "Average iteration time (s)", False, None)
 
     else:
         print("[WARN] 没有任何有效任务被跑到，无法统计。")

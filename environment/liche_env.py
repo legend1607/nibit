@@ -44,7 +44,7 @@ class LicheEnv:
     """
 
     EPS: float = 0.05          # goal 区域半径
-    RRT_EPS: float = 0.05      # edge discretization 步长
+    RRT_EPS: float = 0.08      # edge discretization 步长
     CLOSEST_DIST: float = 1e-3 # getClosestPoints 距离阈值
     MAX_SAMPLE_TRIALS: int = 10000
 

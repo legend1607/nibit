@@ -80,7 +80,7 @@ class ECSP_NeuralWrapper:
         p_free = torch.sigmoid(free_logits).detach().cpu().numpy().astype(np.float32).reshape(-1)
         p_path = torch.sigmoid(pathlogits).detach().cpu().numpy().astype(np.float32).reshape(-1)
         return p_free, p_path
-
+    
     @torch.no_grad()
     def get_free_mask(self, joints_np, prob_th: float = 0.5):
         p_free, _ = self.predict_probs(joints_np)

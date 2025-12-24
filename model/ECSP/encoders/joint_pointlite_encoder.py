@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 from model.ECSP.mlp import JointMLPEncoder
-from model.encoders.pointnetlite_encoder import AttentionPointNet
-from model.cae.CNN_3d import Encoder_CNN_3D
+from model.ECSP.encoders.pointnetlite_encoder import AttentionPointNet
+from model.ECSP.cae.CNN_3d import Encoder_CNN_3D
 
 class JointPointNetEncoder(nn.Module):
     def __init__(

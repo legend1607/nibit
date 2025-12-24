@@ -115,6 +115,15 @@ class RRTBaseND:
         self.vertex_parents = np.zeros(1 + self.iter_max, dtype=int)
         self.vertices[0] = self.x_start  # start parent is itself
         self.num_vertices = 1
+
+        # ---- g-cost array (O(1) cost lookup) + children adjacency for fast subtree updates ----
+        # g_costs[i] = cost-to-come from start to vertex i along current parent pointers.
+        self.g_costs = np.full(1 + self.iter_max, np.inf, dtype=np.float64)
+        self.g_costs[0] = 0.0
+
+        # children adjacency (fixed capacity list-of-lists): children[parent] = [child1, child2, ...]
+        self.children = [[] for _ in range(1 + self.iter_max)]
+
         self.path = []
 
         self.env = env
@@ -298,13 +307,57 @@ class RRTBaseND:
             if not self.utils.is_inside_obs(p):
                 return p
 
-    def cost(self, vertex_index: int) -> float:
-        c = 0.0
-        while vertex_index != 0:
-            parent = int(self.vertex_parents[vertex_index])
-            c += float(np.linalg.norm(self.vertices[vertex_index] - self.vertices[parent]))
-            vertex_index = parent
-        return c
+def cost(self, vertex_index: int) -> float:
+    """O(1) cost-to-come lookup via maintained g_costs array."""
+    return float(self.g_costs[int(vertex_index)])
+
+def _edge_cost_idx(self, a_idx: int, b_idx: int) -> float:
+    a_idx = int(a_idx); b_idx = int(b_idx)
+    return float(np.linalg.norm(self.vertices[a_idx] - self.vertices[b_idx]))
+
+def _remove_child_link(self, parent_idx: int, child_idx: int):
+    parent_idx = int(parent_idx); child_idx = int(child_idx)
+    ch = self.children[parent_idx]
+    # remove first occurrence if exists (small list on average)
+    for i, c in enumerate(ch):
+        if int(c) == child_idx:
+            ch.pop(i)
+            return
+
+def _propagate_costs_from(self, root_idx: int):
+    """Recompute g_costs for root's descendants (BFS) after root's cost changes."""
+    root_idx = int(root_idx)
+    q = [root_idx]
+    while q:
+        u = int(q.pop())
+        gu = float(self.g_costs[u])
+        for v in self.children[u]:
+            v = int(v)
+            # v's parent is u by construction
+            self.g_costs[v] = gu + self._edge_cost_idx(u, v)
+            q.append(v)
+
+def _attach(self, child_idx: int, new_parent_idx: int):
+    """Set/rewire parent of child_idx to new_parent_idx and update g_costs in O(size(subtree))."""
+    child_idx = int(child_idx); new_parent_idx = int(new_parent_idx)
+    if child_idx == 0:
+        return  # start/root stays root
+
+    old_parent = int(self.vertex_parents[child_idx])
+    if old_parent == new_parent_idx:
+        return
+
+    # unlink from old parent
+    if old_parent >= 0:
+        self._remove_child_link(old_parent, child_idx)
+
+    # link to new parent
+    self.vertex_parents[child_idx] = new_parent_idx
+    self.children[new_parent_idx].append(child_idx)
+
+    # update child's g and propagate to descendants
+    self.g_costs[child_idx] = float(self.g_costs[new_parent_idx]) + self._edge_cost_idx(new_parent_idx, child_idx)
+    self._propagate_costs_from(child_idx)
 
     def extract_path(self, goal_parent_index: int):
         path = [self.x_goal]
@@ -390,8 +443,8 @@ class RRTStarND(RRTBaseND):
                 else:
                     node_new_index = self.num_vertices
                     self.vertices[node_new_index] = node_new
-                    self.vertex_parents[node_new_index] = node_nearest_index
                     self.num_vertices += 1
+                    self._attach(node_new_index, int(node_nearest_index))
                     curr_node_new_cost = self.cost(node_nearest_index) + self.Line(node_nearest, node_new)
 
                 neighbor_indices = self.find_near_neighbors(node_new, node_new_index)
@@ -424,7 +477,7 @@ class RRTStarND(RRTBaseND):
         node_new_cost_candidates = np.array(neighbor_costs, dtype=float) + dist_neighbors_to_new
         best_idx = int(np.argmin(node_new_cost_candidates))
         if float(node_new_cost_candidates[best_idx]) < float(curr_node_new_cost):
-            self.vertex_parents[node_new_index] = int(neighbor_indices[best_idx])
+            self._attach(node_new_index, int(neighbor_indices[best_idx]))
 
     def rewire(self, node_new, neighbor_indices, node_new_index):
         vec_new_to_neighbors = self.vertices[: self.num_vertices][neighbor_indices] - node_new
@@ -433,7 +486,7 @@ class RRTStarND(RRTBaseND):
         for i, neighbor_index in enumerate(neighbor_indices):
             neighbor_index = int(neighbor_index)
             if self.cost(neighbor_index) > node_new_cost + float(dist_new_to_neighbors[i]):
-                self.vertex_parents[neighbor_index] = int(node_new_index)
+                self._attach(neighbor_index, int(node_new_index))
 
     def search_goal_parent(self):
         vec_to_goal = self.x_goal - self.vertices[: self.num_vertices]
@@ -598,7 +651,7 @@ class IRRTStarND(RRTStarND):
                                 node_min_index = node_near_index
                                 cost_min = cost_new
 
-                    self.vertex_parents[node_new_index] = int(node_min_index)
+                    self._attach(node_new_index, int(node_min_index))
                     self.rewire(node_new, neighbor_indices, node_new_index)
 
                     if self.InGoalRegion(node_new):
@@ -1052,7 +1105,7 @@ class NIRRTStarND(IRRTStarND):
                                 node_min_index = node_near_index
                                 cost_min = cost_new
 
-                    self.vertex_parents[node_new_index] = int(node_min_index)
+                    self._attach(node_new_index, int(node_min_index))
                     self.rewire(node_new, neighbor_indices, node_new_index)
 
                     if self.InGoalRegion(node_new):

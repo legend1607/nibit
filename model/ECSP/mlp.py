@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model.modules.builders import build_fc_layers
+from model.ECSP.modules.builders import build_fc_layers
 
 
 class JointMLPEncoder(nn.Module):
