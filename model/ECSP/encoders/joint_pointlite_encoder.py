@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from model.ECSP.mlp import JointMLPEncoder
-from model.ECSP.encoders.pointnetlite_encoder import AttentionPointNet
+from model.ECSP.encoders.pointnetlite_encoder import AttentionPointNet,AttentionPointNet2
 from model.ECSP.cae.CNN_3d import Encoder_CNN_3D
 
 class JointPointNetEncoder(nn.Module):
@@ -26,6 +26,7 @@ class JointPointNetEncoder(nn.Module):
         cls_dropout: float = 0.1,
         path_dropout: float = 0.1,
         cross_dropout: float = 0.1,
+        net2=True
     ):
         super().__init__()
 
@@ -65,18 +66,33 @@ class JointPointNetEncoder(nn.Module):
         )
 
         # 4) pointnet: concat joint(64) + env_global(64) => 128
-        self.pointnet = AttentionPointNet(
-            in_dim=joint_feat_dim + joint_feat_dim,  # 64 + 64
-            embed_dim=pointnet_embed_dim,
-            hidden_dims=pointnet_hidden,
-            num_heads=self_attn_heads,
-            num_layers=self_attn_layers,
-            attn_dropout=self_attn_dropout,
-            ff_multiplier=self_attn_ff_multiplier,
-            use_attn_pool=use_attn_pool,
-            mlp_dropout=point_mlp_dropout,
-            feat_dropout=point_feat_dropout,
-        )
+        if net2==True:
+            self.pointnet = AttentionPointNet2(
+                in_dim=joint_feat_dim + env_latent_dim,    # 64+64=128
+                embed_dim=pointnet_embed_dim,              # 128 or 256
+                hidden_dims=pointnet_hidden,               # [128,256] etc
+                num_heads=self_attn_heads,
+                num_layers=self_attn_layers,               # 2~3 推荐
+                k=32,                             # 8/16/32 推荐
+                attn_dropout=self_attn_dropout,
+                ff_multiplier=self_attn_ff_multiplier,
+                mlp_dropout=point_mlp_dropout,
+                feat_dropout=point_feat_dropout,
+                use_attn_pool=True
+            )
+        else:
+            self.pointnet = AttentionPointNet(
+                in_dim=joint_feat_dim + joint_feat_dim,  # 64 + 64
+                embed_dim=pointnet_embed_dim,
+                hidden_dims=pointnet_hidden,
+                num_heads=self_attn_heads,
+                num_layers=self_attn_layers,
+                attn_dropout=self_attn_dropout,
+                ff_multiplier=self_attn_ff_multiplier,
+                use_attn_pool=use_attn_pool,
+                mlp_dropout=point_mlp_dropout,
+                feat_dropout=point_feat_dropout,
+            )
 
         # 5) heads
         self.shared_head_fc = nn.Linear(pointnet_embed_dim * 2, pointnet_embed_dim)

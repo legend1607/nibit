@@ -15,10 +15,10 @@ from demo_planning_arm import (
     get_env_configs,
     get_problem_input,
 )
-from neural_wrapper import ECSP_NeuralWrapper
+from neural_wrapper import ECSP_NeuralWrapper, PNGWrapper
 from path_planning_classes_arm.bit_star import get_bit_planner as get_bit_planner_bit
 from path_planning_classes_arm.nibit_star_fixed import get_bit_planner as get_bit_planner_nibit
-from path_planning_classes_arm.irrtstar import get_irrtstar_planner, get_nirrtstar_planner
+from path_planning_classes_arm.irrtstar_updated import get_irrtstar_planner, get_nirrtstarECSP_planner, get_nirrtstar_png_planner
 from path_planning_classes_arm.bifmtstar import get_bifmt_planner
 
 
@@ -48,15 +48,22 @@ def build_planner(planner_name, args, problem, nw_cache):
     elif name == "IRRTSTAR":
         return get_irrtstar_planner(args, problem, neural_wrapper=None)
 
-    elif name == "NIRRTSTAR":
-        if "NIRRTSTAR" not in nw_cache:
-            nw_cache["NIRRTSTAR"] = ECSP_NeuralWrapper(
+    elif name == "NIRRTSTARECSP":
+        if "NIRRTSTARECSP" not in nw_cache:
+            nw_cache["NIRRTSTARECSP"] = ECSP_NeuralWrapper(
                 problem=problem,
-                ckpt_path=args.ckpt,
+                ckpt_path="results/model_training/train_20251215-144528/best.pt",
                 voxel_resolution=tuple(args.voxel_resolution),
                 device="cuda",
             )
-        return get_nirrtstar_planner(args, problem, neural_wrapper=nw_cache["NIRRTSTAR"])
+        return get_nirrtstarECSP_planner(args, problem, neural_wrapper=nw_cache["NIRRTSTARECSP"])
+
+    elif name == "NIRRTSTARPNG":
+        if "NIRRTSTARPNG" not in nw_cache:
+            nw_cache["NIRRTSTARPNG"] = PNGWrapper(
+                device="cuda",
+            )
+        return get_nirrtstar_png_planner(args, problem, neural_wrapper=nw_cache["NIRRTSTARPNG"])
 
     elif name == "BIFMTSTAR":
         return get_bifmt_planner(args, problem, neural_wrapper=None)
@@ -874,16 +881,15 @@ def parse_args():
     parser.add_argument("--traj_idx", type=int, default=-1)
 
     # 规划算法列表
-    parser.add_argument("--planners", nargs="+", type=str, default=["IRRTSTAR", "NIRRTSTAR"],
+    parser.add_argument("--planners", nargs="+", type=str, default=["IRRTSTAR","NIRRTSTARPNG","NIRRTSTARECSP"],
                         help="要对比的规划算法，例如: --planners BITStar NIBITStar")
 
     # BIT*/NIBIT* 公共参数
     parser.add_argument("--iter_max", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=200)
-    parser.add_argument("--pc_n_points", type=int, default=2048)
+    parser.add_argument("--pc_n_points", type=int, default=2000)
 
     # NIBIT 相关
-    parser.add_argument("--ckpt", type=str, default="results/model_training/train_20251215-144528/best.pt")
     parser.add_argument("--voxel_resolution", type=int, nargs=3, default=[50, 50, 50])
 
     parser.add_argument("--gui", action="store_true")

@@ -924,8 +924,19 @@ class NIRRTStarECSP(IRRTStarND):
             self.Xguide = []
             return
 
-        # If no solution yet, don't refresh guidance (optional; keep behavior stable)
+        # If no solution yet: still build guidance from GLOBAL candidates,
+        # but do it periodically (or when cache empty) to avoid extra NN cost.
         if not np.isfinite(c_best):
+            refresh_every = 20
+            if (not self.Xguide) or (k % refresh_every == 0):
+                try:
+                    bs = max(self.guidance_batch_size_min, int(self.guidance_batch_size))
+                    self.Xguide = self.sample_from_env(c_best, bs)  # will use global sampling
+                    # do NOT update _last_guidance_cost (still inf)
+                    new_bs = int(round(self.guidance_batch_size * self.guidance_batch_decay))
+                    self.guidance_batch_size = max(self.guidance_batch_size_min, new_bs)
+                except Exception:
+                    self.Xguide = []
             return
 
         # ---- minimal improvement thresholds (tune here) ----
@@ -1130,6 +1141,331 @@ class NIRRTStarECSP(IRRTStarND):
             final_solution_nodes,
         )
 
+
+class NIRRTStarPNGND(IRRTStarND):
+    """Neural-Informed IRRT* with PNG-style point-cloud guidance (nD).
+
+    This is an n-dimensional generalization of the uploaded 3D NIRRT*-PNG class.
+    It generates a candidate point cloud (either globally or from the current
+    informed subset) and queries `png_wrapper.classify_path_points(...)` to keep
+    only the points predicted to lie on a likely path. During planning, the
+    sampler mixes:
+      - point-cloud guided samples with probability `pc_sample_rate`
+      - otherwise: standard IRRT* informed/global samples
+
+    Expected PNG wrapper API (same as the 3D version):
+        path_pred, path_score = png_wrapper.classify_path_points(
+            pc: np.ndarray [N,dim] float32,
+            start_mask: np.ndarray [N] float32,
+            goal_mask: np.ndarray [N] float32,
+        )
+    where `path_pred` is a binary/boolean vector (or values where nonzero means True).
+    """
+
+    def __init__(
+        self,
+        start,
+        goal,
+        environment,
+        iter_max,
+        batch_size,
+        neural_wrapper,
+        plot_flag=False,
+        timer=None,
+        step_len=None,
+        search_radius=None,
+        clearance=None,
+        pc_n_points: int = 2048,
+        pc_over_sample_scale: int = 4,
+        pc_sample_rate: float = 0.5,
+        pc_update_cost_ratio: float = 0.98,
+    ):
+        super().__init__(
+            start=start,
+            goal=goal,
+            environment=environment,
+            iter_max=iter_max,
+            batch_size=batch_size,
+            plot_flag=plot_flag,
+            timer=timer,
+            step_len=step_len,
+            search_radius=search_radius,
+            clearance=clearance,
+        )
+        self.png_wrapper = neural_wrapper
+
+        self.pc_n_points = int(pc_n_points)
+        self.pc_over_sample_scale = int(pc_over_sample_scale)
+        self.pc_sample_rate = float(pc_sample_rate)
+        self.pc_update_cost_ratio = float(pc_update_cost_ratio)
+
+        # use step_len as the neighborhood radius (mirrors 3D version)
+        self.pc_neighbor_radius = float(self.step_len)*5
+
+        self.path_point_cloud_pred = None  # np.ndarray [M,dim] or None
+        self.pose_range=self.env.pose_range
+        self._pc_low = self.pose_range[:, 0]
+        self._pc_high = self.pose_range[:, 1]
+        self._pc_span = self._pc_high - self._pc_low
+        self._pc_span[self._pc_span == 0] = 1e-6
+
+        # optional visualizer hook (not provided in this nD file)
+        # callers may set self.visualizer if they have one.
+        # self.visualizer should expose: set_path_point_cloud_pred(pc)
+        # and animation(...) like other visualizers.
+        self.visualizer = getattr(self, "visualizer", None)
+
+    # ---------------- Point cloud helpers ----------------
+    def _normalize_pc(self, pc: np.ndarray) -> np.ndarray:
+        pc = np.asarray(pc, dtype=np.float32)
+        pc_norm = (pc - self._pc_low) / self._pc_span
+        pc_norm = np.clip(pc_norm, 0.0, 1.0)
+        return pc_norm.astype(np.float32)
+
+    def _mask_around_points(self, pc: np.ndarray, points: np.ndarray, radius: float) -> np.ndarray:
+        """Return boolean mask for pc points within `radius` of any `points`."""
+        if pc is None or len(pc) == 0:
+            return np.zeros((0,), dtype=bool)
+        pts = np.asarray(points, dtype=float).reshape((-1, self.dim))
+        r2 = float(radius) ** 2
+        # compute min squared distance to any anchor point
+        # (N,1,dim) - (1,M,dim) -> (N,M,dim)
+        dif = pc[:, None, :] - pts[None, :, :]
+        d2 = np.sum(dif * dif, axis=-1)  # (N,M)
+        return (np.min(d2, axis=1) <= r2)
+
+    def _global_point_cloud(self, n_points: int) -> np.ndarray:
+        lo = self.bound[:, 0] + self.clearance
+        hi = self.bound[:, 1] - self.clearance
+        # guard against invalid bounds after clearance
+        hi = np.maximum(hi, lo + 1e-9)
+        return np.random.uniform(lo[None, :], hi[None, :], size=(int(n_points), self.dim))
+
+    def _informed_point_cloud(self, cmax: float, cmin: float, x_center: np.ndarray, C: np.ndarray, n_points: int) -> np.ndarray:
+        # reuse IRRTStarND informed sampling (with validity checks) for robustness
+        pc = []
+        for _ in range(int(n_points)):
+            pc.append(self.SampleInformedSubset(float(cmax), float(cmin), x_center, C))
+        return np.asarray(pc, dtype=float).reshape((-1, self.dim))
+
+    def update_point_cloud(self, cmax: float, cmin: float, x_center: np.ndarray, C: np.ndarray):
+        """Generate point cloud and run PNG wrapper to keep predicted path points."""
+        if self.pc_sample_rate <= 0.0:
+            self.path_point_cloud_pred = None
+            if hasattr(self.visualizer, "set_path_point_cloud_pred"):
+                self.visualizer.set_path_point_cloud_pred(self.path_point_cloud_pred)
+            return
+
+        n_raw = int(max(1, self.pc_n_points * max(1, self.pc_over_sample_scale)))
+
+        if np.isfinite(cmax):
+            pc = self._informed_point_cloud(cmax, cmin, x_center, C, n_raw)
+        else:
+            pc = self._global_point_cloud(n_raw)
+
+        start_mask = self._mask_around_points(pc, self.x_start[None, :], self.pc_neighbor_radius)
+        goal_mask = self._mask_around_points(pc, self.x_goal[None, :], self.pc_neighbor_radius)
+        # If no wrapper, fallback to using the raw point cloud directly
+        if self.png_wrapper is None:
+            self.path_point_cloud_pred = pc
+        else:
+            pc_norm = self._normalize_pc(pc)
+            path_pred, _ = self.png_wrapper.classify_path_points(
+                pc_norm,
+                start_mask.astype(np.float32),
+                goal_mask.astype(np.float32),
+            )
+            path_pred = np.asarray(path_pred).reshape((-1,))
+            keep = np.nonzero(path_pred)[0]
+            self.path_point_cloud_pred = pc[keep] if len(keep) > 0 else np.zeros((0, self.dim), dtype=float)
+
+        if hasattr(self.visualizer, "set_path_point_cloud_pred"):
+            self.visualizer.set_path_point_cloud_pred(self.path_point_cloud_pred)
+
+    def init_pc(self, x_center: np.ndarray, C: np.ndarray, cmin: float):
+        self.update_point_cloud(cmax=np.inf, cmin=float(cmin), x_center=x_center, C=C)
+
+    def SamplePointCloud(self):
+        pc = self.path_point_cloud_pred
+        if pc is None or len(pc) == 0:
+            return None
+        idx = int(np.random.randint(0, len(pc)))
+        return np.array(pc[idx], dtype=float)
+
+    # ---------------- Planning override ----------------
+
+    def generate_random_node_png(
+        self,
+        c_curr: float,
+        c_min: float,
+        x_center: np.ndarray,
+        C: np.ndarray,
+        c_update: float,
+    ):
+        # Refresh PC when best cost improves enough
+        if np.isfinite(c_curr) and (c_curr < self.pc_update_cost_ratio * float(c_update)):
+            self.update_point_cloud(cmax=float(c_curr), cmin=float(c_min), x_center=x_center, C=C)
+            c_update = float(c_curr)
+
+        # Sample from PC with probability pc_sample_rate
+        if (self.pc_sample_rate > 0.0) and (np.random.random() < self.pc_sample_rate):
+            g = self.SamplePointCloud()
+            if g is not None and self.utils.is_valid(g):
+                return g, c_update
+
+        # Fallback to standard IRRT* sampler
+        if np.isfinite(c_curr):
+            return self.SampleInformedSubset(float(c_curr), float(c_min), x_center, C), c_update
+        return self.SampleFree(), c_update
+
+    def planning(self, visualize=False, refresh_interval=1):
+        """Plan a path (same return signature as IRRTStarND.planning)."""
+        start_checks = getattr(self.env, "collision_check_count", 0)
+        init_time = time()
+
+        iteration_costs = []
+        iteration_times = []
+        first_solution_iter = None
+        first_solution_cost = None
+        first_solution_nodes = None
+        final_solution_nodes = 0
+
+        start_goal_straightline_dist, x_center, C = self.init()
+        c_best = np.inf
+        x_best = None
+
+        # init point cloud in global mode
+        self.init_pc(x_center=x_center, C=C, cmin=float(start_goal_straightline_dist))
+        c_update = np.inf
+
+        for k in range(self.iter_max):
+            final_iter = k
+
+            if len(self.path_solutions) > 0:
+                c_best, x_best = self.find_best_path_solution()
+
+            node_rand, c_update = self.generate_random_node_png(
+                c_best, start_goal_straightline_dist, x_center, C, c_update
+            )
+
+            node_nearest_index = self._nearest_index(node_rand)
+            node_nearest = self.vertices[node_nearest_index]
+            node_new = self.new_state(node_nearest, node_rand)
+
+            if not self.utils.is_collision(node_nearest, node_new):
+                if np.linalg.norm(node_new - node_nearest) < 1e-8:
+                    pass
+                else:
+                    node_near, neighbor_indices = self.near_neighbors(node_new, k_nearest=25)
+                    node_new_index = self.num_vertices
+                    self.vertices[node_new_index] = node_new
+                    self.num_vertices += 1
+
+                    node_min_index = node_nearest_index
+                    cost_min = self.cost(node_nearest_index) + float(np.linalg.norm(node_new - node_nearest))
+
+                    for node_near_index in neighbor_indices:
+                        node_near_index = int(node_near_index)
+                        if node_near_index == node_nearest_index:
+                            continue
+                        node_near_i = self.vertices[node_near_index]
+                        if not self.utils.is_collision(node_near_i, node_new):
+                            cost_new = self.cost(node_near_index) + float(np.linalg.norm(node_new - node_near_i))
+                            if cost_new < cost_min:
+                                node_min_index = node_near_index
+                                cost_min = cost_new
+
+                    self.vertex_parents[node_new_index] = int(node_min_index)
+                    self.rewire(node_new, neighbor_indices, node_new_index)
+
+                    if self.InGoalRegion(node_new):
+                        self.path_solutions.append(int(node_new_index))
+
+            cur_time = time() - init_time
+            iteration_times.append(cur_time)
+            iteration_costs.append(float(c_best) if np.isfinite(c_best) else np.inf)
+
+            if first_solution_iter is None and np.isfinite(c_best) and x_best is not None:
+                first_solution_iter = k + 1
+                first_solution_cost = float(c_best)
+                try:
+                    tmp_path = self.extract_path(x_best)
+                    first_solution_nodes = len(tmp_path) if tmp_path is not None else None
+                except Exception:
+                    first_solution_nodes = None
+
+        if len(self.path_solutions) > 0:
+            c_best, x_best = self.find_best_path_solution()
+            self.path = self.extract_path(x_best)
+        else:
+            self.path = []
+            c_best = np.inf
+
+        if visualize:
+            try:
+                self.visualize(x_center, c_best, start_goal_straightline_dist, C)
+            except Exception:
+                pass
+
+        def _to_key_list(path_arr):
+            return [self.to_key(p) for p in path_arr]
+
+        path_keys = _to_key_list(self.path) if isinstance(self.path, np.ndarray) and len(self.path) > 0 else []
+        final_solution_nodes = len(path_keys) if path_keys else 0
+
+        samples = [self.to_key(p) for p in self.vertices[: self.num_vertices]]
+
+        edges = {}
+        for idx in range(1, self.num_vertices):
+            parent_idx = int(self.vertex_parents[idx])
+            child_k = self.to_key(self.vertices[idx])
+            parent_k = self.to_key(self.vertices[parent_idx])
+            edges[child_k] = parent_k
+
+        n_checks = getattr(self.env, "collision_check_count", 0) - start_checks
+        best_cost = float(c_best) if np.isfinite(c_best) else np.inf
+        total_samples = int(self.num_vertices)
+        runtime = time() - init_time
+
+        return (
+            path_keys,
+            samples,
+            edges,
+            n_checks,
+            best_cost,
+            total_samples,
+            runtime,
+            final_iter if "final_iter" in locals() else 0,
+            iteration_costs,
+            iteration_times,
+            first_solution_iter,
+            first_solution_cost,
+            first_solution_nodes,
+            final_solution_nodes,
+        )
+
+
+def get_nirrtstar_png_planner(args, problem, neural_wrapper):
+    """Factory for NIRRT*-PNG (nD)."""
+    return NIRRTStarPNGND(
+        start=problem.get("start", problem.get("x_start")),
+        goal=problem.get("goal", problem.get("x_goal")),
+        environment=problem.get("env", problem.get("environment")),
+        iter_max=args.iter_max,
+        batch_size=getattr(args, "batch_size", 200),
+        neural_wrapper=neural_wrapper,
+        plot_flag=getattr(args, "plot_flag", False),
+        timer=problem.get("timer", None) if isinstance(problem, dict) else None,
+        step_len=getattr(args, "step_len", None),
+        search_radius=problem.get("search_radius", None),
+        clearance=getattr(args, "clearance", None),
+        pc_n_points=getattr(args, "pc_n_points", 2048),
+        pc_over_sample_scale=getattr(args, "pc_over_sample_scale", 3),
+        pc_sample_rate=getattr(args, "pc_sample_rate", 0.5),
+        pc_update_cost_ratio=getattr(args, "pc_update_cost_ratio", 0.98),
+    )
+
+
 # ------------------ Factories (kept for compatibility) ------------------
 
 
@@ -1176,7 +1512,7 @@ def get_irrtstar_planner(args, problem, neural_wrapper=None):
     return planner
 
 
-def get_nirrtstar_planner(args, problem, neural_wrapper=None):
+def get_nirrtstarECSP_planner(args, problem, neural_wrapper=None):
     """Factory for NIRRT* (hybrid IRRT* + neural guidance)."""
     planner = NIRRTStarECSP(
         problem.get("start", problem.get("x_start")),
